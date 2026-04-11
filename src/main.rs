@@ -6,6 +6,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod parser;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
