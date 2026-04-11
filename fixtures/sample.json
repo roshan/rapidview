@@ -1,0 +1,28 @@
+{
+  "name": "Rapid View",
+  "version": "0.1.0",
+  "features": [
+    "prettify",
+    "scroll-lock",
+    "breadcrumbs",
+    "copy-jq"
+  ],
+  "metrics": {
+    "cold_launch_ms": 120,
+    "parser_mbps": 375,
+    "huge_file_support": true
+  },
+  "tags": null,
+  "owner": {
+    "name": "George",
+    "email": "george@example.com"
+  },
+  "sample unicode": "日本語 / 😀",
+  "nested": {
+    "deep": {
+      "deeper": {
+        "value": 42
+      }
+    }
+  }
+}

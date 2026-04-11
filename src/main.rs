@@ -6,14 +6,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod doc;
+mod json_view;
 mod parser;
 
+use json_view::JsonView;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSMenu, NSMenuItem, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSMenu, NSMenuItem, NSScrollView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -22,6 +25,7 @@ use objc2_foundation::{
 mod app_state {
     //! Process-wide state. Single-threaded access from the main thread only;
     //! the worker thread talks back via mpsc, so we don't need a Mutex here.
+    use crate::json_view::JsonView;
     use objc2::rc::Retained;
     use objc2_app_kit::NSWindow;
     use std::cell::RefCell;
@@ -29,6 +33,7 @@ mod app_state {
 
     thread_local! {
         pub static MAIN_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+        pub static JSON_VIEW: RefCell<Option<Retained<JsonView>>> = const { RefCell::new(None) };
     }
 
     pub static SELFTEST_LAUNCH: AtomicBool = AtomicBool::new(false);
@@ -48,6 +53,13 @@ define_class!(
             let mtm = self.mtm();
             install_menu_bar(mtm);
             open_main_window(mtm);
+            // Dev convenience: first non-flag argv is treated as a file to open.
+            for arg in std::env::args().skip(1) {
+                if !arg.starts_with('-') {
+                    load_file_from_path(&arg);
+                    break;
+                }
+            }
             if app_state::SELFTEST_LAUNCH.load(std::sync::atomic::Ordering::Relaxed) {
                 std::process::exit(0);
             }
@@ -60,10 +72,10 @@ define_class!(
 
         #[unsafe(method(application:openURLs:))]
         fn open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
-            // Turn 1 stub: just log. Turn 2+ routes this to the document loader.
             for url in urls.iter() {
                 if let Some(path) = url.path() {
-                    eprintln!("open: {}", path);
+                    load_file_from_path(&path.to_string());
+                    break;
                 }
             }
         }
@@ -120,9 +132,67 @@ fn open_main_window(mtm: MainThreadMarker) {
     };
     window.setTitle(&NSString::from_str("Rapid View"));
     window.center();
+
+    // Scroll view covering the full content area.
+    let content_frame = window
+        .contentView()
+        .expect("window has content view")
+        .frame();
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), content_frame);
+    scroll.setHasVerticalScroller(true);
+    scroll.setHasHorizontalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    let json_view = JsonView::new(mtm, json_view::initial_frame());
+    scroll.setDocumentView(Some(&json_view));
+
+    window.setContentView(Some(&scroll));
     window.makeKeyAndOrderFront(None);
 
     app_state::MAIN_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
+    app_state::JSON_VIEW.with(|slot| *slot.borrow_mut() = Some(json_view));
+}
+
+fn load_file_from_path(path: &str) {
+    let t0 = std::time::Instant::now();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rapid-view: failed to read {}: {}", path, e);
+            return;
+        }
+    };
+    let size = bytes.len();
+    let document = doc::Document::from_bytes(bytes);
+    let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "loaded {} ({} bytes, {} lines) in {:.1} ms",
+        path,
+        size,
+        document.line_count(),
+        parse_ms
+    );
+    app_state::JSON_VIEW.with(|slot| {
+        if let Some(view) = slot.borrow().as_ref() {
+            view.set_document(document);
+        }
+    });
+    app_state::MAIN_WINDOW.with(|slot| {
+        if let Some(window) = slot.borrow().as_ref() {
+            let title = NSString::from_str(&format!(
+                "Rapid View — {}",
+                std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string())
+            ));
+            window.setTitle(&title);
+        }
+    });
 }
 
 fn main() {

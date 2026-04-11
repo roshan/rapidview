@@ -15,6 +15,7 @@ features = [
     "NSString",
     "NSArray",
     "NSDictionary",
+    "NSAttributedString",
     "NSNotification",
     "NSURL",
     "NSError",
@@ -56,6 +57,9 @@ features = [
     "NSPanel",
     "NSTrackingArea",
     "NSCursor",
+    "NSAttributedString",
+    "NSStringDrawing",
+    "NSParagraphStyle",
 ]
 
 [dependencies.objc2-core-text]
