@@ -10,16 +10,20 @@ mod doc;
 mod json_view;
 mod parser;
 
-use json_view::JsonView;
+use json_view::{JsonView, ViewMode};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSMenu, NSMenuItem, NSScrollView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSButton, NSColor, NSFont, NSLayoutConstraint, NSLayoutConstraintOrientation, NSMenu,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSScrollView, NSStackView,
+    NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSView,
+    NSViewBoundsDidChangeNotification, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    NSArray, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString, NSURL,
 };
 
 mod app_state {
@@ -27,13 +31,14 @@ mod app_state {
     //! the worker thread talks back via mpsc, so we don't need a Mutex here.
     use crate::json_view::JsonView;
     use objc2::rc::Retained;
-    use objc2_app_kit::NSWindow;
+    use objc2_app_kit::{NSButton, NSWindow};
     use std::cell::RefCell;
     use std::sync::atomic::AtomicBool;
 
     thread_local! {
         pub static MAIN_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
         pub static JSON_VIEW: RefCell<Option<Retained<JsonView>>> = const { RefCell::new(None) };
+        pub static MODE_BUTTON: RefCell<Option<Retained<NSButton>>> = const { RefCell::new(None) };
     }
 
     pub static SELFTEST_LAUNCH: AtomicBool = AtomicBool::new(false);
@@ -52,7 +57,7 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
             install_menu_bar(mtm);
-            open_main_window(mtm);
+            open_main_window(mtm, self);
             // Dev convenience: first non-flag argv is treated as a file to open.
             for arg in std::env::args().skip(1) {
                 if !arg.starts_with('-') {
@@ -77,6 +82,56 @@ define_class!(
                     load_file_from_path(&path.to_string());
                     break;
                 }
+            }
+        }
+    }
+
+    // Custom action methods (not part of any Cocoa protocol) live in
+    // their own `impl` block so define_class! doesn't try to verify
+    // them against NSApplicationDelegate.
+    impl AppDelegate {
+        #[unsafe(method(rvToggleMode:))]
+        fn rv_toggle_mode(&self, _sender: &NSButton) {
+            let new_mode = match json_view::view_mode() {
+                ViewMode::Cursor => ViewMode::ScrollLock,
+                ViewMode::ScrollLock => ViewMode::Cursor,
+            };
+            json_view::set_view_mode(new_mode);
+            update_mode_button_title();
+            refresh_current_path();
+        }
+
+        #[unsafe(method(rvTogglePrettify:))]
+        fn rv_toggle_prettify(&self, _sender: &NSButton) {
+            // T5 owns the actual prettify toggle (re-parses the pretty
+            // buffer on the worker). Stub for now so the button is alive.
+            eprintln!("prettify toggle — wired in T5");
+        }
+
+        #[unsafe(method(rvCopyJq:))]
+        fn rv_copy_jq(&self, _sender: &NSButton) {
+            let expr = app_state::JSON_VIEW.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|v| v.current_jq_expression())
+                    .unwrap_or_else(|| String::from("."))
+            });
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let ns = NSString::from_str(&expr);
+            unsafe {
+                let type_str: &NSString = NSPasteboardTypeString;
+                let types = NSArray::from_slice(&[type_str]);
+                pb.declareTypes_owner(&types, None);
+                pb.setString_forType(&ns, type_str);
+            }
+            eprintln!("copied jq: {}", expr);
+        }
+
+        #[unsafe(method(rvClipDidScroll:))]
+        fn rv_clip_did_scroll(&self, _notif: &NSNotification) {
+            if json_view::view_mode() == ViewMode::ScrollLock {
+                refresh_current_path();
             }
         }
     }
@@ -115,7 +170,7 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     app.setMainMenu(Some(&menubar));
 }
 
-fn open_main_window(mtm: MainThreadMarker) {
+fn open_main_window(mtm: MainThreadMarker, delegate: &AppDelegate) {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(960.0, 720.0));
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
@@ -133,28 +188,161 @@ fn open_main_window(mtm: MainThreadMarker) {
     window.setTitle(&NSString::from_str("Rapid View"));
     window.center();
 
-    // Scroll view covering the full content area.
-    let content_frame = window
-        .contentView()
-        .expect("window has content view")
-        .frame();
-    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), content_frame);
+    let content_view = window.contentView().expect("window has content view");
+    let content_bounds = content_view.bounds();
+
+    // Scroll view with the custom JsonView as document view.
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), content_bounds);
     scroll.setHasVerticalScroller(true);
     scroll.setHasHorizontalScroller(true);
     scroll.setAutohidesScrollers(true);
     scroll.setBorderType(objc2_app_kit::NSBorderType::NoBorder);
-    scroll.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
-    );
 
     let json_view = JsonView::new(mtm, json_view::initial_frame());
     scroll.setDocumentView(Some(&json_view));
 
-    window.setContentView(Some(&scroll));
+    // Header bar: [Cursor] [Prettify] <breadcrumb label> [Copy jq]
+    let delegate_obj = delegate as &objc2::runtime::AnyObject;
+    let (header, breadcrumb_label, mode_button) = build_header_bar(mtm, delegate_obj);
+    json_view.set_breadcrumb(breadcrumb_label);
+    app_state::MODE_BUTTON.with(|slot| *slot.borrow_mut() = Some(mode_button));
+
+    // Stack header over scroll view, filling the content view.
+    let stack_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
+        &*header as &NSView,
+        &*scroll as &NSView,
+    ]);
+    let stack = NSStackView::stackViewWithViews(&stack_views, mtm);
+    stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+    stack.setSpacing(0.0);
+    stack.setDistribution(NSStackViewDistribution::Fill);
+    stack.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    content_view.addSubview(&stack);
+
+    // Pin the outer stack to the content view's edges.
+    let constraints = NSArray::from_retained_slice(&[
+        stack
+            .leadingAnchor()
+            .constraintEqualToAnchor(&content_view.leadingAnchor()),
+        stack
+            .trailingAnchor()
+            .constraintEqualToAnchor(&content_view.trailingAnchor()),
+        stack
+            .topAnchor()
+            .constraintEqualToAnchor(&content_view.topAnchor()),
+        stack
+            .bottomAnchor()
+            .constraintEqualToAnchor(&content_view.bottomAnchor()),
+    ]);
+    NSLayoutConstraint::activateConstraints(&constraints);
+
+    // Scroll-lock observer: wake whenever the clip view's bounds change.
+    let clip_view = scroll.contentView();
+    clip_view.setPostsBoundsChangedNotifications(true);
+    let center = NSNotificationCenter::defaultCenter();
+    unsafe {
+        let name: &NSString = NSViewBoundsDidChangeNotification;
+        center.addObserver_selector_name_object(
+            delegate_obj,
+            objc2::sel!(rvClipDidScroll:),
+            Some(name),
+            Some(&clip_view),
+        );
+    }
+
     window.makeKeyAndOrderFront(None);
 
     app_state::MAIN_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
     app_state::JSON_VIEW.with(|slot| *slot.borrow_mut() = Some(json_view));
+
+    update_mode_button_title();
+}
+
+fn build_header_bar(
+    mtm: MainThreadMarker,
+    target: &objc2::runtime::AnyObject,
+) -> (Retained<NSStackView>, Retained<NSTextField>, Retained<NSButton>) {
+    let mode_button = make_button(mtm, "Cursor", target, objc2::sel!(rvToggleMode:));
+    let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
+    let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
+
+    let label = {
+        let s = NSString::from_str(".");
+        let tf = NSTextField::labelWithString(&s, mtm);
+        tf.setFont(Some(&NSFont::userFixedPitchFontOfSize(12.0).unwrap()));
+        tf.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        tf.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
+        tf.setSelectable(true);
+        tf
+    };
+
+    let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
+        &*mode_button as &NSView,
+        &*prettify_button as &NSView,
+        &*label as &NSView,
+        &*copy_button as &NSView,
+    ]);
+    let header = NSStackView::stackViewWithViews(&header_views, mtm);
+    header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+    header.setSpacing(8.0);
+    header.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+        top: 6.0,
+        left: 10.0,
+        bottom: 6.0,
+        right: 10.0,
+    });
+
+    // Let the label eat all leftover horizontal space between the left
+    // and right button groups.
+    header.setHuggingPriority_forOrientation(
+        249.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+    label.setContentHuggingPriority_forOrientation(
+        10.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+    label.setContentCompressionResistancePriority_forOrientation(
+        100.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+
+    (header, label, mode_button)
+}
+
+fn make_button(
+    mtm: MainThreadMarker,
+    title: &str,
+    target: &objc2::runtime::AnyObject,
+    action: objc2::runtime::Sel,
+) -> Retained<NSButton> {
+    let ns_title = NSString::from_str(title);
+    let btn = unsafe {
+        NSButton::buttonWithTitle_target_action(&ns_title, Some(target), Some(action), mtm)
+    };
+    btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Automatic);
+    btn
+}
+
+fn update_mode_button_title() {
+    let title = match json_view::view_mode() {
+        ViewMode::Cursor => "Cursor",
+        ViewMode::ScrollLock => "Scroll-lock",
+    };
+    app_state::MODE_BUTTON.with(|slot| {
+        if let Some(btn) = slot.borrow().as_ref() {
+            btn.setTitle(&NSString::from_str(title));
+        }
+    });
+}
+
+fn refresh_current_path() {
+    app_state::JSON_VIEW.with(|slot| {
+        if let Some(view) = slot.borrow().as_ref() {
+            view.refresh_path_display();
+        }
+    });
 }
 
 fn load_file_from_path(path: &str) {
