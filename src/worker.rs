@@ -50,6 +50,17 @@ pub fn spawn_load(path: String, tx: Sender<WorkerMsg>) {
     });
 }
 
+/// Spawn a worker that parses an in-memory byte buffer (clipboard
+/// contents, typically) and delivers it as `DocumentReady` with the
+/// given display label as the "path".
+pub fn spawn_parse_bytes(bytes: Vec<u8>, label: String, tx: Sender<WorkerMsg>) {
+    thread::spawn(move || {
+        let owned: Arc<[u8]> = Arc::<[u8]>::from(bytes.into_boxed_slice());
+        let doc = Document::from_source(ByteSource::Owned(owned));
+        let _ = tx.send(WorkerMsg::DocumentReady { doc, path: label });
+    });
+}
+
 /// Spawn a worker that pretty-prints the given bytes and parses the
 /// result, returning a second `Document` that main can swap into the
 /// view when the user toggles Prettify.

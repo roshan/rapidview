@@ -129,6 +129,11 @@ define_class!(
             toggle_prettify();
         }
 
+        #[unsafe(method(rvPasteJson:))]
+        fn rv_paste_json(&self, _sender: &NSButton) {
+            paste_from_clipboard();
+        }
+
         #[unsafe(method(rvWorkerTick:))]
         fn rv_worker_tick(&self, _timer: &NSTimer) {
             drain_worker();
@@ -296,6 +301,7 @@ fn build_header_bar(
     Retained<NSButton>,
     Retained<NSButton>,
 ) {
+    let paste_button = make_button(mtm, "Paste", target, objc2::sel!(rvPasteJson:));
     let mode_button = make_button(mtm, "Cursor", target, objc2::sel!(rvToggleMode:));
     let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
     let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
@@ -311,6 +317,7 @@ fn build_header_bar(
     };
 
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
+        &*paste_button as &NSView,
         &*mode_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
@@ -376,6 +383,44 @@ fn refresh_current_path() {
             view.refresh_path_display();
         }
     });
+}
+
+fn paste_from_clipboard() {
+    // Read the generic string contents. NSPasteboardTypeString covers
+    // anything that declares itself as text, including JSON copied from
+    // a browser, a terminal, or another editor.
+    let pb = NSPasteboard::generalPasteboard();
+    let maybe_text = unsafe {
+        let type_str: &NSString = NSPasteboardTypeString;
+        pb.stringForType(type_str)
+    };
+    let Some(ns_text) = maybe_text else {
+        eprintln!("rapid-view: clipboard has no text");
+        return;
+    };
+    let text = ns_text.to_string();
+    if text.trim().is_empty() {
+        eprintln!("rapid-view: clipboard text is empty");
+        return;
+    }
+
+    // Same reset dance as opening a file, but the "path" is a synthetic
+    // label so the window title / breadcrumb still have something to
+    // show. Routing through the worker keeps the architecture uniform
+    // and means a huge pasted blob parses in the background.
+    let label = "<clipboard>".to_string();
+    set_window_title("Rapid View — parsing clipboard…");
+    app_state::IS_PRETTY.with(|c| c.set(false));
+    app_state::PRETTY_PENDING.with(|c| c.set(false));
+    app_state::PRETTY_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::ORIGINAL_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::CURRENT_PATH.with(|slot| *slot.borrow_mut() = Some(label.clone()));
+    update_prettify_button_title();
+
+    let tx = ensure_worker_channel();
+    app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    worker::spawn_parse_bytes(text.into_bytes(), label, tx);
+    ensure_poll_timer();
 }
 
 fn load_file_from_path(path: &str) {
