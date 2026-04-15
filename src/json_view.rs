@@ -233,6 +233,23 @@ impl JsonView {
         self.refresh_path_display();
     }
 
+    /// Drop the current document and reset click/selection state. The
+    /// view paints as an empty dark canvas and the breadcrumb goes back
+    /// to ".".
+    pub fn clear_document(&self) {
+        let ivars = self.ivars();
+        *ivars.doc.borrow_mut() = None;
+        ivars.last_click_offset.set(None);
+        // Collapse the document view back to the clip-view size so the
+        // scroll bars go away.
+        if let Some(clip) = unsafe { self.superview() } {
+            let clip_bounds = clip.bounds();
+            self.setFrameSize(clip_bounds.size);
+        }
+        self.setNeedsDisplay(true);
+        self.refresh_path_display();
+    }
+
     /// Byte offset that currently drives the breadcrumb, chosen by
     /// `view_mode()`. Returns None if nothing has been clicked in cursor
     /// mode; scroll-lock mode always returns the topmost visible line.

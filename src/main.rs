@@ -134,6 +134,11 @@ define_class!(
             paste_from_clipboard();
         }
 
+        #[unsafe(method(rvClearDocument:))]
+        fn rv_clear_document(&self, _sender: &NSButton) {
+            clear_view();
+        }
+
         #[unsafe(method(rvWorkerTick:))]
         fn rv_worker_tick(&self, _timer: &NSTimer) {
             drain_worker();
@@ -317,6 +322,11 @@ fn build_header_bar(
     Retained<NSButton>,
 ) {
     let paste_button = make_button(mtm, "Paste", target, objc2::sel!(rvPasteJson:));
+    // Cmd+V triggers the Paste button while the window is key. No Edit
+    // menu needed — NSButton consumes the key equivalent directly.
+    paste_button.setKeyEquivalent(&NSString::from_str("v"));
+    paste_button.setKeyEquivalentModifierMask(objc2_app_kit::NSEventModifierFlags::Command);
+    let clear_button = make_button(mtm, "Clear", target, objc2::sel!(rvClearDocument:));
     let mode_button = make_button(mtm, "Cursor", target, objc2::sel!(rvToggleMode:));
     let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
     let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
@@ -333,6 +343,7 @@ fn build_header_bar(
 
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
         &*paste_button as &NSView,
+        &*clear_button as &NSView,
         &*mode_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
@@ -396,6 +407,21 @@ fn refresh_current_path() {
     app_state::JSON_VIEW.with(|slot| {
         if let Some(view) = slot.borrow().as_ref() {
             view.refresh_path_display();
+        }
+    });
+}
+
+fn clear_view() {
+    app_state::ORIGINAL_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::PRETTY_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::CURRENT_PATH.with(|slot| *slot.borrow_mut() = None);
+    app_state::IS_PRETTY.with(|c| c.set(false));
+    app_state::PRETTY_PENDING.with(|c| c.set(false));
+    update_prettify_button_title();
+    set_window_title("Rapid View");
+    app_state::JSON_VIEW.with(|slot| {
+        if let Some(view) = slot.borrow().as_ref() {
+            view.clear_document();
         }
     });
 }
