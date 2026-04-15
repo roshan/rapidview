@@ -9,6 +9,8 @@
 mod doc;
 mod json_view;
 mod parser;
+mod pretty;
+mod worker;
 
 use json_view::{JsonView, ViewMode};
 use objc2::rc::Retained;
@@ -23,23 +25,44 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSArray, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL,
+    NSSize, NSString, NSTimer, NSURL,
 };
+use worker::{WorkerChannel, WorkerMsg};
 
 mod app_state {
     //! Process-wide state. Single-threaded access from the main thread only;
     //! the worker thread talks back via mpsc, so we don't need a Mutex here.
+    use crate::doc::Document;
     use crate::json_view::JsonView;
+    use crate::worker::WorkerChannel;
     use objc2::rc::Retained;
     use objc2_app_kit::{NSButton, NSWindow};
-    use std::cell::RefCell;
-    use std::sync::atomic::AtomicBool;
+    use objc2_foundation::NSTimer;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI32};
 
     thread_local! {
         pub static MAIN_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
         pub static JSON_VIEW: RefCell<Option<Retained<JsonView>>> = const { RefCell::new(None) };
         pub static MODE_BUTTON: RefCell<Option<Retained<NSButton>>> = const { RefCell::new(None) };
+        pub static PRETTIFY_BUTTON: RefCell<Option<Retained<NSButton>>> = const { RefCell::new(None) };
+
+        pub static WORKER: RefCell<Option<WorkerChannel>> = const { RefCell::new(None) };
+        pub static POLL_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
+
+        pub static CURRENT_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
+        pub static ORIGINAL_DOC: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
+        pub static PRETTY_DOC: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
+        pub static IS_PRETTY: Cell<bool> = const { Cell::new(false) };
+        pub static PRETTY_PENDING: Cell<bool> = const { Cell::new(false) };
     }
+
+    /// Number of outstanding worker jobs. Incremented when a job is
+    /// spawned, decremented when a terminal message is processed. The
+    /// polling timer stops as soon as this hits zero so we aren't
+    /// burning a 60Hz tick for nothing.
+    pub static WORK_PENDING: AtomicI32 = AtomicI32::new(0);
 
     pub static SELFTEST_LAUNCH: AtomicBool = AtomicBool::new(false);
 }
@@ -103,9 +126,12 @@ define_class!(
 
         #[unsafe(method(rvTogglePrettify:))]
         fn rv_toggle_prettify(&self, _sender: &NSButton) {
-            // T5 owns the actual prettify toggle (re-parses the pretty
-            // buffer on the worker). Stub for now so the button is alive.
-            eprintln!("prettify toggle — wired in T5");
+            toggle_prettify();
+        }
+
+        #[unsafe(method(rvWorkerTick:))]
+        fn rv_worker_tick(&self, _timer: &NSTimer) {
+            drain_worker();
         }
 
         #[unsafe(method(rvCopyJq:))]
@@ -203,9 +229,11 @@ fn open_main_window(mtm: MainThreadMarker, delegate: &AppDelegate) {
 
     // Header bar: [Cursor] [Prettify] <breadcrumb label> [Copy jq]
     let delegate_obj = delegate as &objc2::runtime::AnyObject;
-    let (header, breadcrumb_label, mode_button) = build_header_bar(mtm, delegate_obj);
+    let (header, breadcrumb_label, mode_button, prettify_button) =
+        build_header_bar(mtm, delegate_obj);
     json_view.set_breadcrumb(breadcrumb_label);
     app_state::MODE_BUTTON.with(|slot| *slot.borrow_mut() = Some(mode_button));
+    app_state::PRETTIFY_BUTTON.with(|slot| *slot.borrow_mut() = Some(prettify_button));
 
     // Stack header over scroll view, filling the content view.
     let stack_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
@@ -262,7 +290,12 @@ fn open_main_window(mtm: MainThreadMarker, delegate: &AppDelegate) {
 fn build_header_bar(
     mtm: MainThreadMarker,
     target: &objc2::runtime::AnyObject,
-) -> (Retained<NSStackView>, Retained<NSTextField>, Retained<NSButton>) {
+) -> (
+    Retained<NSStackView>,
+    Retained<NSTextField>,
+    Retained<NSButton>,
+    Retained<NSButton>,
+) {
     let mode_button = make_button(mtm, "Cursor", target, objc2::sel!(rvToggleMode:));
     let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
     let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
@@ -308,7 +341,7 @@ fn build_header_bar(
         NSLayoutConstraintOrientation::Horizontal,
     );
 
-    (header, label, mode_button)
+    (header, label, mode_button, prettify_button)
 }
 
 fn make_button(
@@ -346,41 +379,234 @@ fn refresh_current_path() {
 }
 
 fn load_file_from_path(path: &str) {
-    let t0 = std::time::Instant::now();
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("rapid-view: failed to read {}: {}", path, e);
+    // Show a loading placeholder immediately so the UI never looks
+    // frozen, then hand off to the worker.
+    set_window_title(&format!("Rapid View — loading {}…", basename(path)));
+    app_state::IS_PRETTY.with(|c| c.set(false));
+    app_state::PRETTY_PENDING.with(|c| c.set(false));
+    app_state::PRETTY_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::ORIGINAL_DOC.with(|slot| *slot.borrow_mut() = None);
+    app_state::CURRENT_PATH.with(|slot| *slot.borrow_mut() = Some(path.to_string()));
+    update_prettify_button_title();
+
+    let tx = ensure_worker_channel();
+    app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    worker::spawn_load(path.to_string(), tx);
+    ensure_poll_timer();
+}
+
+fn ensure_worker_channel() -> std::sync::mpsc::Sender<WorkerMsg> {
+    app_state::WORKER.with(|slot| {
+        let mut b = slot.borrow_mut();
+        if b.is_none() {
+            *b = Some(WorkerChannel::new());
+        }
+        b.as_ref().unwrap().tx.clone()
+    })
+}
+
+fn ensure_poll_timer() {
+    app_state::POLL_TIMER.with(|slot| {
+        if slot.borrow().is_some() {
             return;
         }
-    };
-    let size = bytes.len();
-    let document = doc::Document::from_bytes(bytes);
-    let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "loaded {} ({} bytes, {} lines) in {:.1} ms",
-        path,
-        size,
-        document.line_count(),
-        parse_ms
-    );
+        // Every 16 ms — roughly one display frame. The tick handler
+        // drops the timer as soon as WORK_PENDING falls to zero, so
+        // this only burns cycles while something is actually parsing.
+        let timer = with_app_delegate(|delegate| unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.016,
+                delegate,
+                objc2::sel!(rvWorkerTick:),
+                None,
+                true,
+            )
+        });
+        *slot.borrow_mut() = Some(timer);
+    });
+}
+
+fn drain_worker() {
+    // Copy messages out under a short borrow so downstream helpers can
+    // re-enter app_state without tripping RefCell rules.
+    let msgs: Vec<WorkerMsg> = app_state::WORKER.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(chan) = borrow.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(m) = chan.rx.try_recv() {
+            out.push(m);
+        }
+        out
+    });
+
+    for msg in msgs {
+        match msg {
+            WorkerMsg::DocumentReady { doc, path } => {
+                on_document_ready(doc, &path);
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WorkerMsg::PrettyReady(doc) => {
+                on_pretty_ready(doc);
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WorkerMsg::Error(e) => {
+                eprintln!("rapid-view: {}", e);
+                set_window_title("Rapid View");
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    if app_state::WORK_PENDING.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
+        app_state::POLL_TIMER.with(|slot| {
+            if let Some(t) = slot.borrow().as_ref() {
+                t.invalidate();
+            }
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn on_document_ready(doc: std::sync::Arc<doc::Document>, path: &str) {
+    let size = doc.bytes.len();
+    let lines = doc.line_count();
+    eprintln!("loaded {} ({} bytes, {} lines)", path, size, lines);
+    app_state::ORIGINAL_DOC.with(|slot| *slot.borrow_mut() = Some(doc.clone()));
+    app_state::IS_PRETTY.with(|c| c.set(false));
     app_state::JSON_VIEW.with(|slot| {
         if let Some(view) = slot.borrow().as_ref() {
-            view.set_document(document);
+            view.set_document(doc);
         }
     });
+    set_window_title(&format!("Rapid View — {}", basename(path)));
+    update_prettify_button_title();
+}
+
+fn on_pretty_ready(doc: std::sync::Arc<doc::Document>) {
+    app_state::PRETTY_DOC.with(|slot| *slot.borrow_mut() = Some(doc.clone()));
+    app_state::PRETTY_PENDING.with(|c| c.set(false));
+    // If the user is still asking to see pretty (IS_PRETTY was set
+    // optimistically when they clicked), swap it in now.
+    if app_state::IS_PRETTY.with(|c| c.get()) {
+        app_state::JSON_VIEW.with(|slot| {
+            if let Some(view) = slot.borrow().as_ref() {
+                view.set_document(doc);
+            }
+        });
+    }
+    update_prettify_button_title();
+    refresh_title_for_current_mode();
+}
+
+fn toggle_prettify() {
+    let is_pretty_now = app_state::IS_PRETTY.with(|c| c.get());
+    if is_pretty_now {
+        // Swap back to the original document.
+        let original = app_state::ORIGINAL_DOC.with(|slot| slot.borrow().clone());
+        let Some(original) = original else {
+            return;
+        };
+        app_state::IS_PRETTY.with(|c| c.set(false));
+        app_state::JSON_VIEW.with(|slot| {
+            if let Some(view) = slot.borrow().as_ref() {
+                view.set_document(original);
+            }
+        });
+        update_prettify_button_title();
+        refresh_title_for_current_mode();
+        return;
+    }
+
+    // Flip to pretty. If it's already cached, swap instantly. Otherwise
+    // spawn the worker and flip optimistically — the tick handler will
+    // actually install the doc when it arrives.
+    if let Some(pretty) = app_state::PRETTY_DOC.with(|slot| slot.borrow().clone()) {
+        app_state::IS_PRETTY.with(|c| c.set(true));
+        app_state::JSON_VIEW.with(|slot| {
+            if let Some(view) = slot.borrow().as_ref() {
+                view.set_document(pretty);
+            }
+        });
+        update_prettify_button_title();
+        refresh_title_for_current_mode();
+        return;
+    }
+
+    let Some(original) = app_state::ORIGINAL_DOC.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let source = original.bytes.clone();
+    app_state::IS_PRETTY.with(|c| c.set(true));
+    app_state::PRETTY_PENDING.with(|c| c.set(true));
+    update_prettify_button_title();
+    set_window_title("Rapid View — prettifying…");
+
+    let tx = ensure_worker_channel();
+    app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    worker::spawn_prettify(source, tx);
+    ensure_poll_timer();
+}
+
+fn update_prettify_button_title() {
+    let title = if app_state::IS_PRETTY.with(|c| c.get()) {
+        "Original"
+    } else {
+        "Prettify"
+    };
+    app_state::PRETTIFY_BUTTON.with(|slot| {
+        if let Some(btn) = slot.borrow().as_ref() {
+            btn.setTitle(&NSString::from_str(title));
+        }
+    });
+}
+
+fn refresh_title_for_current_mode() {
+    let Some(path) = app_state::CURRENT_PATH.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let suffix = if app_state::IS_PRETTY.with(|c| c.get()) {
+        " · pretty"
+    } else {
+        ""
+    };
+    set_window_title(&format!("Rapid View — {}{}", basename(&path), suffix));
+}
+
+fn set_window_title(title: &str) {
+    let ns = NSString::from_str(title);
     app_state::MAIN_WINDOW.with(|slot| {
         if let Some(window) = slot.borrow().as_ref() {
-            let title = NSString::from_str(&format!(
-                "Rapid View — {}",
-                std::path::Path::new(path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string())
-            ));
-            window.setTitle(&title);
+            window.setTitle(&ns);
         }
     });
+}
+
+fn basename(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Run `f` with a borrow of the `AppDelegate` stored in the process-wide
+/// `NSApplication`. The delegate is retained elsewhere (by NSApplication)
+/// so we just cast the delegate pointer.
+fn with_app_delegate<R>(f: impl FnOnce(&objc2::runtime::AnyObject) -> R) -> R {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    let delegate = app
+        .delegate()
+        .expect("AppDelegate installed before worker ticks");
+    // ProtocolObject derefs to NSObject which is an AnyObject — go
+    // through a pointer cast rather than a Deref we don't have.
+    let delegate_ptr: *const objc2::runtime::ProtocolObject<
+        dyn NSApplicationDelegate,
+    > = &*delegate;
+    let delegate_obj: &objc2::runtime::AnyObject =
+        unsafe { &*(delegate_ptr as *const objc2::runtime::AnyObject) };
+    f(delegate_obj)
 }
 
 fn main() {

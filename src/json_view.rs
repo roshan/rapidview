@@ -35,6 +35,10 @@ const PAD_TOP: f64 = 8.0;
 const PAD_RIGHT: f64 = 12.0;
 const PAD_BOTTOM: f64 = 8.0;
 const FONT_SIZE: f64 = 13.0;
+/// AppKit starts tiling poorly around 2^24 pixels; we clamp the frame
+/// width at ~8k monospace characters, well under that limit and still
+/// larger than any realistic single JSON line.
+const MAX_LINE_BYTES_FOR_LAYOUT: f64 = 8_000.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -195,9 +199,12 @@ impl JsonView {
     pub fn set_document(&self, doc: Arc<Document>) {
         let ivars = self.ivars();
 
-        // Size the view to fit the document.
+        // Size the view to fit the document. Minified JSON can put the
+        // entire file on one line — clamp width so AppKit doesn't choke
+        // on a multi-million-pixel frame. The user can still toggle
+        // Prettify to get a wrappable, well-formatted view.
         let line_count = doc.line_count() as f64;
-        let max_bytes = doc.max_line_bytes as f64;
+        let max_bytes = (doc.max_line_bytes as f64).min(MAX_LINE_BYTES_FOR_LAYOUT);
         let content_h = (line_count * ivars.line_height) + PAD_TOP + PAD_BOTTOM;
         let content_w = (max_bytes * ivars.advance) + PAD_LEFT + PAD_RIGHT;
 

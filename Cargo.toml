@@ -17,6 +17,8 @@ features = [
     "NSDictionary",
     "NSAttributedString",
     "NSNotification",
+    "NSTimer",
+    "NSRunLoop",
     "NSURL",
     "NSError",
     "NSGeometry",

@@ -1,15 +1,38 @@
 //! Document model — owns the byte buffer and the parse indexes.
 //!
-//! Loading is synchronous today (invoked from the main thread after file
-//! open). T5 moves the parse onto a worker thread with progress reporting.
+//! Backing storage is a `ByteSource` so an open document can be either an
+//! `mmap`'d file (zero-copy, great for huge inputs) or an owned byte
+//! buffer (used for pretty-printed output which has no on-disk source).
+//! `ByteSource` is cheaply cloneable — both variants are `Arc`-wrapped —
+//! so the worker thread and the main thread can share the same bytes.
 
 #![allow(dead_code)]
 
 use crate::parser::{self, ParseOutput};
+use memmap2::Mmap;
 use std::sync::Arc;
 
+#[derive(Clone)]
+pub enum ByteSource {
+    Mmap(Arc<Mmap>),
+    Owned(Arc<[u8]>),
+}
+
+impl ByteSource {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ByteSource::Mmap(m) => m.as_ref(),
+            ByteSource::Owned(v) => v,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
 pub struct Document {
-    pub bytes: Vec<u8>,
+    pub bytes: ByteSource,
     pub output: ParseOutput,
     /// Longest line in bytes — used to size the document view width so
     /// long lines don't trigger per-frame layout scans.
@@ -17,8 +40,8 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn from_bytes(bytes: Vec<u8>) -> Arc<Self> {
-        let output = parser::parse(&bytes);
+    pub fn from_source(bytes: ByteSource) -> Arc<Self> {
+        let output = parser::parse(bytes.as_slice());
         let max_line_bytes = max_line_length(&output.line_starts, bytes.len() as u32);
         Arc::new(Self {
             bytes,
@@ -34,17 +57,17 @@ impl Document {
     /// Bytes of `line` with any trailing `\n` / `\r\n` stripped.
     pub fn line_bytes(&self, line: usize) -> &[u8] {
         let starts = &self.output.line_starts;
+        let all = self.bytes.as_slice();
         if starts.is_empty() {
-            return &self.bytes;
+            return all;
         }
         let start = starts[line] as usize;
         let end = if line + 1 < starts.len() {
-            // next line starts *after* the newline, so strip one byte
             (starts[line + 1] as usize).saturating_sub(1)
         } else {
-            self.bytes.len()
+            all.len()
         };
-        let slice = &self.bytes[start..end.min(self.bytes.len())];
+        let slice = &all[start..end.min(all.len())];
         if slice.ends_with(b"\r") {
             &slice[..slice.len() - 1]
         } else {
