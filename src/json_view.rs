@@ -87,6 +87,8 @@ pub struct JsonViewIvars {
 struct Colors {
     fg: Retained<NSColor>,
     bg: Retained<NSColor>,
+    /// Background band drawn behind the line containing the last click.
+    row_highlight: Retained<NSColor>,
     key: Retained<NSColor>,
     string: Retained<NSColor>,
     number: Retained<NSColor>,
@@ -142,6 +144,8 @@ define_class!(
                 if view_mode() == ViewMode::Cursor {
                     self.refresh_path_display();
                 }
+                // Repaint so the row-highlight band follows the click.
+                self.setNeedsDisplay(true);
             }
         }
     }
@@ -165,6 +169,9 @@ impl JsonView {
         // Monokai-ish palette on a dark background.
         let fg = rgb(0.97, 0.97, 0.95);
         let bg = rgb(0.12, 0.13, 0.15);
+        // Subtle bluish lift over the bg — visible but doesn't drown
+        // out the syntax colours on top.
+        let row_highlight = rgb(0.20, 0.26, 0.36);
         let key = rgb(0.40, 0.85, 0.94);
         let string_ = rgb(0.90, 0.86, 0.45);
         let number = rgb(0.68, 0.50, 1.00);
@@ -183,6 +190,7 @@ impl JsonView {
             colors: Colors {
                 fg,
                 bg,
+                row_highlight,
                 key,
                 string: string_,
                 number,
@@ -330,6 +338,22 @@ impl JsonView {
         let styles = &doc.output.styles;
         let line_starts = &doc.output.line_starts;
 
+        // Row highlight band — drawn before the text so colours land on
+        // top. Only drawn when the selected line is inside `dirty`.
+        if let Some(click) = ivars.last_click_offset.get() {
+            let hit = line_for_offset(click, line_starts);
+            if hit >= first && hit <= last {
+                let bounds = self.bounds();
+                let y = PAD_TOP + hit as f64 * line_h;
+                let band = NSRect::new(
+                    NSPoint::new(0.0, y),
+                    NSSize::new(bounds.size.width, line_h),
+                );
+                ivars.colors.row_highlight.setFill();
+                objc2_app_kit::NSRectFill(band);
+            }
+        }
+
         for line_idx in first..=last {
             let line_start_byte = line_starts[line_idx];
             let bytes = doc.line_bytes(line_idx);
@@ -453,4 +477,47 @@ fn measure_char_advance(font: &NSFont) -> f64 {
 
 pub fn initial_frame() -> NSRect {
     NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(960.0, 720.0))
+}
+
+/// Binary search `line_starts` for the line containing `offset`. Returns
+/// 0 when `starts` is empty (no lines yet).
+fn line_for_offset(offset: u32, starts: &[u32]) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let mut lo = 0usize;
+    let mut hi = starts.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if starts[mid] <= offset {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo.saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_for_offset_finds_containing_line() {
+        let starts = vec![0u32, 10, 20, 35];
+        assert_eq!(line_for_offset(0, &starts), 0);
+        assert_eq!(line_for_offset(5, &starts), 0);
+        assert_eq!(line_for_offset(9, &starts), 0);
+        assert_eq!(line_for_offset(10, &starts), 1);
+        assert_eq!(line_for_offset(15, &starts), 1);
+        assert_eq!(line_for_offset(34, &starts), 2);
+        assert_eq!(line_for_offset(35, &starts), 3);
+        assert_eq!(line_for_offset(1000, &starts), 3);
+    }
+
+    #[test]
+    fn line_for_offset_empty_is_zero() {
+        assert_eq!(line_for_offset(0, &[]), 0);
+        assert_eq!(line_for_offset(42, &[]), 0);
+    }
 }

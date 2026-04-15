@@ -176,26 +176,41 @@ impl AppDelegate {
 }
 
 fn install_menu_bar(mtm: MainThreadMarker) {
-    // macOS convention: the first menu in the menu bar is the "app" menu
-    // and its title is overridden to the process name. Turn 1 only needs
-    // Quit to work; richer menus come in later turns.
+    // macOS convention: the first menu in the menu bar is the "app"
+    // menu — its title is replaced at runtime by the process name.
     let menubar = NSMenu::new(mtm);
+
+    // App menu (Quit).
     let app_menu_item = NSMenuItem::new(mtm);
     menubar.addItem(&app_menu_item);
-
     let app_menu = NSMenu::new(mtm);
-    let quit_title = NSString::from_str("Quit Rapid View");
-    let quit_key = NSString::from_str("q");
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &quit_title,
+            &NSString::from_str("Quit Rapid View"),
             Some(objc2::sel!(terminate:)),
-            &quit_key,
+            &NSString::from_str("q"),
         )
     };
     app_menu.addItem(&quit_item);
     app_menu_item.setSubmenu(Some(&app_menu));
+
+    // File menu (Close). `performClose:` with a nil target walks the
+    // responder chain and reaches the key NSWindow.
+    let file_menu_item = NSMenuItem::new(mtm);
+    menubar.addItem(&file_menu_item);
+    let file_menu =
+        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
+    let close_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Close"),
+            Some(objc2::sel!(performClose:)),
+            &NSString::from_str("w"),
+        )
+    };
+    file_menu.addItem(&close_item);
+    file_menu_item.setSubmenu(Some(&file_menu));
 
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menubar));
