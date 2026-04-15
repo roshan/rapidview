@@ -28,7 +28,6 @@ use objc2_foundation::{
 };
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 const PAD_LEFT: f64 = 12.0;
 const PAD_TOP: f64 = 8.0;
@@ -41,31 +40,9 @@ const FONT_SIZE: f64 = 13.0;
 const MAX_LINE_BYTES_FOR_LAYOUT: f64 = 8_000.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ViewMode {
-    Cursor = 0,
-    ScrollLock = 1,
-}
-
-impl ViewMode {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            1 => ViewMode::ScrollLock,
-            _ => ViewMode::Cursor,
-        }
-    }
-}
-
-/// Shared mode flag. Click/scroll handlers both read it, the toolbar
-/// button writes it. Single byte, no synchronisation cost.
-pub static VIEW_MODE: AtomicU8 = AtomicU8::new(ViewMode::Cursor as u8);
-
-pub fn set_view_mode(m: ViewMode) {
-    VIEW_MODE.store(m as u8, Ordering::Relaxed);
-}
-
-pub fn view_mode() -> ViewMode {
-    ViewMode::from_u8(VIEW_MODE.load(Ordering::Relaxed))
+    Cursor,
+    ScrollLock,
 }
 
 pub struct JsonViewIvars {
@@ -78,6 +55,10 @@ pub struct JsonViewIvars {
     /// Pre-built attribute dictionary for the default text colour.
     default_attrs: Retained<NSDictionary<NSString>>,
     colors: Colors,
+    /// Per-view cursor vs scroll-lock selection. Tabs have independent
+    /// modes so a user can leave one tab scroll-locked while another is
+    /// in cursor mode.
+    mode: Cell<ViewMode>,
     /// Byte offset of the last click. None until the user clicks.
     last_click_offset: Cell<Option<u32>>,
     /// Breadcrumb label set by main.rs after the header bar is built.
@@ -141,7 +122,7 @@ define_class!(
             let local = self.convertPoint_fromView(window_point, None);
             if let Some(offset) = self.point_to_byte_offset(local) {
                 self.ivars().last_click_offset.set(Some(offset));
-                if view_mode() == ViewMode::Cursor {
+                if self.view_mode() == ViewMode::Cursor {
                     self.refresh_path_display();
                 }
                 // Repaint so the row-highlight band follows the click.
@@ -197,6 +178,7 @@ impl JsonView {
                 bool_,
                 null,
             },
+            mode: Cell::new(ViewMode::Cursor),
             last_click_offset: Cell::new(None),
             breadcrumb: RefCell::new(None),
         };
@@ -228,6 +210,14 @@ impl JsonView {
         self.refresh_path_display();
     }
 
+    pub fn view_mode(&self) -> ViewMode {
+        self.ivars().mode.get()
+    }
+
+    pub fn set_view_mode(&self, m: ViewMode) {
+        self.ivars().mode.set(m);
+    }
+
     pub fn set_breadcrumb(&self, label: Retained<NSTextField>) {
         *self.ivars().breadcrumb.borrow_mut() = Some(label);
         self.refresh_path_display();
@@ -255,7 +245,7 @@ impl JsonView {
     /// mode; scroll-lock mode always returns the topmost visible line.
     pub fn current_offset(&self) -> Option<u32> {
         let ivars = self.ivars();
-        match view_mode() {
+        match self.view_mode() {
             ViewMode::Cursor => ivars.last_click_offset.get(),
             ViewMode::ScrollLock => self.viewport_top_offset(),
         }

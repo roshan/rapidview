@@ -17,13 +17,26 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+/// Every worker message is tagged with a window identifier so the
+/// dispatcher can route it to the right tab. The identifier is the
+/// raw NSWindow pointer reinterpreted as a usize — stable for the
+/// window's lifetime, zero cost to compare.
+pub type WindowId = usize;
+
 pub enum WorkerMsg {
     /// The original document is ready.
-    DocumentReady { doc: Arc<Document>, path: String },
+    DocumentReady {
+        window_id: WindowId,
+        doc: Arc<Document>,
+        path: String,
+    },
     /// The pretty-printed document is ready.
-    PrettyReady(Arc<Document>),
+    PrettyReady {
+        window_id: WindowId,
+        doc: Arc<Document>,
+    },
     /// Load or pretty job failed.
-    Error(String),
+    Error { window_id: WindowId, message: String },
 }
 
 pub struct WorkerChannel {
@@ -39,12 +52,19 @@ impl WorkerChannel {
 }
 
 /// Spawn a worker that opens `path`, mmaps it, parses it, and sends a
-/// `DocumentReady` on the channel. Errors come back as `Error(msg)`.
-pub fn spawn_load(path: String, tx: Sender<WorkerMsg>) {
+/// `DocumentReady` on the channel. Errors come back as `Error { .. }`.
+pub fn spawn_load(window_id: WindowId, path: String, tx: Sender<WorkerMsg>) {
     thread::spawn(move || {
         let msg = match load(&path) {
-            Ok(doc) => WorkerMsg::DocumentReady { doc, path },
-            Err(e) => WorkerMsg::Error(format!("open {}: {}", path, e)),
+            Ok(doc) => WorkerMsg::DocumentReady {
+                window_id,
+                doc,
+                path,
+            },
+            Err(e) => WorkerMsg::Error {
+                window_id,
+                message: format!("open {}: {}", path, e),
+            },
         };
         let _ = tx.send(msg);
     });
@@ -53,23 +73,32 @@ pub fn spawn_load(path: String, tx: Sender<WorkerMsg>) {
 /// Spawn a worker that parses an in-memory byte buffer (clipboard
 /// contents, typically) and delivers it as `DocumentReady` with the
 /// given display label as the "path".
-pub fn spawn_parse_bytes(bytes: Vec<u8>, label: String, tx: Sender<WorkerMsg>) {
+pub fn spawn_parse_bytes(
+    window_id: WindowId,
+    bytes: Vec<u8>,
+    label: String,
+    tx: Sender<WorkerMsg>,
+) {
     thread::spawn(move || {
         let owned: Arc<[u8]> = Arc::<[u8]>::from(bytes.into_boxed_slice());
         let doc = Document::from_source(ByteSource::Owned(owned));
-        let _ = tx.send(WorkerMsg::DocumentReady { doc, path: label });
+        let _ = tx.send(WorkerMsg::DocumentReady {
+            window_id,
+            doc,
+            path: label,
+        });
     });
 }
 
 /// Spawn a worker that pretty-prints the given bytes and parses the
 /// result, returning a second `Document` that main can swap into the
 /// view when the user toggles Prettify.
-pub fn spawn_prettify(source: ByteSource, tx: Sender<WorkerMsg>) {
+pub fn spawn_prettify(window_id: WindowId, source: ByteSource, tx: Sender<WorkerMsg>) {
     thread::spawn(move || {
         let pretty_bytes = pretty::prettify(source.as_slice());
         let owned: Arc<[u8]> = Arc::<[u8]>::from(pretty_bytes.into_boxed_slice());
         let doc = Document::from_source(ByteSource::Owned(owned));
-        let _ = tx.send(WorkerMsg::PrettyReady(doc));
+        let _ = tx.send(WorkerMsg::PrettyReady { window_id, doc });
     });
 }
 
@@ -91,26 +120,33 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    const TEST_WINDOW_ID: WindowId = 0xDEADBEEF;
+
     #[test]
     fn spawn_load_fixture_via_channel() {
         // End-to-end: spawn a worker, pull DocumentReady out of the
         // channel, and sanity-check the parse succeeded.
         let chan = WorkerChannel::new();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample.json").to_string();
-        spawn_load(path, chan.tx.clone());
+        spawn_load(TEST_WINDOW_ID, path, chan.tx.clone());
         let msg = chan
             .rx
             .recv_timeout(Duration::from_secs(5))
             .expect("worker should produce a result within 5s");
         match msg {
-            WorkerMsg::DocumentReady { doc, path } => {
+            WorkerMsg::DocumentReady {
+                window_id,
+                doc,
+                path,
+            } => {
+                assert_eq!(window_id, TEST_WINDOW_ID);
                 assert!(doc.bytes.len() > 0);
                 assert!(doc.line_count() > 1, "fixture has multiple lines");
                 assert!(doc.output.error.is_none(), "fixture parses cleanly");
                 assert!(path.ends_with("sample.json"));
             }
-            WorkerMsg::Error(e) => panic!("unexpected worker error: {}", e),
-            WorkerMsg::PrettyReady(_) => panic!("got PrettyReady from spawn_load"),
+            WorkerMsg::Error { message, .. } => panic!("unexpected worker error: {}", message),
+            WorkerMsg::PrettyReady { .. } => panic!("got PrettyReady from spawn_load"),
         }
     }
 
@@ -118,16 +154,18 @@ mod tests {
     fn spawn_prettify_round_trip() {
         // Pretty-printed buffer should parse cleanly and produce a
         // larger (or equal) byte length than the compact input.
-        let compact: Arc<[u8]> = Arc::<[u8]>::from(br#"{"a":1,"b":[1,2,3]}"#.to_vec().into_boxed_slice());
+        let compact: Arc<[u8]> =
+            Arc::<[u8]>::from(br#"{"a":1,"b":[1,2,3]}"#.to_vec().into_boxed_slice());
         let source = ByteSource::Owned(compact.clone());
         let chan = WorkerChannel::new();
-        spawn_prettify(source, chan.tx.clone());
+        spawn_prettify(TEST_WINDOW_ID, source, chan.tx.clone());
         let msg = chan
             .rx
             .recv_timeout(Duration::from_secs(5))
             .expect("pretty worker should finish within 5s");
         match msg {
-            WorkerMsg::PrettyReady(doc) => {
+            WorkerMsg::PrettyReady { window_id, doc } => {
+                assert_eq!(window_id, TEST_WINDOW_ID);
                 assert!(doc.bytes.len() >= compact.len());
                 assert!(doc.output.error.is_none());
                 assert!(doc.line_count() > 1);
