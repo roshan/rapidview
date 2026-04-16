@@ -102,6 +102,7 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
             install_menu_bar(mtm);
+            install_scroll_observer(self);
             // Always create one window up front. Argv files load into
             // it (first) or new tabs (subsequent).
             new_window(mtm, self);
@@ -205,15 +206,15 @@ define_class!(
 
         #[unsafe(method(rvClipDidScroll:))]
         fn rv_clip_did_scroll(&self, notif: &NSNotification) {
-            // The notification's object is the clip view whose bounds
-            // changed. Its window() tells us which tab to refresh.
+            // NSViewBoundsDidChangeNotification's object is always an
+            // NSView (per the notification contract). We only care
+            // about clip views inside our tabs — the WINDOWS map
+            // lookup filters out anything AppKit posts for its own
+            // internal views.
             let Some(obj) = notif.object() else { return };
-            let clip_ptr = Retained::as_ptr(&obj) as *const objc2_app_kit::NSClipView;
-            let window_ptr = unsafe {
-                let clip: &objc2_app_kit::NSClipView = &*clip_ptr;
-                clip.window()
-            };
-            let Some(window) = window_ptr else { return };
+            let view_ptr = Retained::as_ptr(&obj) as *const NSView;
+            let window = unsafe { (*view_ptr).window() };
+            let Some(window) = window else { return };
             let id = window_id_of(&window);
             app_state::WINDOWS.with(|m| {
                 if let Some(state) = m.borrow().get(&id) {
@@ -234,6 +235,24 @@ impl AppDelegate {
 }
 
 // -- menu bar ---------------------------------------------------------
+
+/// Register one process-wide observer for clip-view bounds changes. The
+/// handler inspects the notification's object, finds its owning window,
+/// and refreshes scroll-locked tabs. Avoids per-window registrations
+/// that would otherwise dangle across tab close.
+fn install_scroll_observer(delegate: &AppDelegate) {
+    let delegate_obj = delegate as &AnyObject;
+    let center = NSNotificationCenter::defaultCenter();
+    unsafe {
+        let name: &NSString = NSViewBoundsDidChangeNotification;
+        center.addObserver_selector_name_object(
+            delegate_obj,
+            objc2::sel!(rvClipDidScroll:),
+            Some(name),
+            None, // any object — handler filters by window lookup
+        );
+    }
+}
 
 fn install_menu_bar(mtm: MainThreadMarker) {
     let menubar = NSMenu::new(mtm);
@@ -326,6 +345,13 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     window.setTitle(&NSString::from_str("Rapid View"));
     window.center();
 
+    // Rust's Retained<NSWindow> inside WindowState is the canonical
+    // owner. The default of YES here makes AppKit send a second
+    // release on user-close, which races with our Drop and double-
+    // frees the window. Disable it; our windowWillClose: hook takes
+    // the map entry out and the Retained drop decrefs cleanly.
+    unsafe { window.setReleasedWhenClosed(false) };
+
     // Tabbing: every window shares an identifier so AppKit auto-tabs
     // them. Preferred mode overrides the system-wide setting.
     window.setTabbingIdentifier(&NSString::from_str("RapidView"));
@@ -381,19 +407,12 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     ]);
     NSLayoutConstraint::activateConstraints(&constraints);
 
-    // Scroll-lock observer tied to this window's clip view.
+    // Scroll-lock observer: the clip view has to post bounds-change
+    // notifications, but the observer registration itself lives at
+    // process scope (see install_scroll_observer) so closing a tab
+    // never leaves behind a dangling per-window registration.
     let clip_view = scroll.contentView();
     clip_view.setPostsBoundsChangedNotifications(true);
-    let center = NSNotificationCenter::defaultCenter();
-    unsafe {
-        let name: &NSString = NSViewBoundsDidChangeNotification;
-        center.addObserver_selector_name_object(
-            delegate_obj,
-            objc2::sel!(rvClipDidScroll:),
-            Some(name),
-            Some(&clip_view),
-        );
-    }
 
     window.makeKeyAndOrderFront(None);
 
