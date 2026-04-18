@@ -146,10 +146,10 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
             install_menu_bar(mtm);
-            // If openURLs already fired (it can on some launch paths),
-            // don't create a duplicate blank window.
-            let has_windows = app_state::WINDOWS.with(|m| !m.borrow().is_empty());
-            if !has_windows {
+            let n = app_state::WINDOWS.with(|m| m.borrow().len());
+            // If openURLs/openFile already fired (it can on some launch
+            // paths), don't create a duplicate blank window.
+            if n == 0 {
                 new_window(mtm, self);
             }
             for arg in std::env::args().skip(1) {
