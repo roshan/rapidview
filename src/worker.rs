@@ -7,7 +7,6 @@
 //! async surface is two events per file (parse done, pretty done), so
 //! anything fancier would be overhead.
 
-#![allow(dead_code)]
 
 use crate::doc::{ByteSource, Document};
 use crate::pretty;
@@ -80,8 +79,7 @@ pub fn spawn_parse_bytes(
     tx: Sender<WorkerMsg>,
 ) {
     thread::spawn(move || {
-        let owned: Arc<[u8]> = Arc::<[u8]>::from(bytes.into_boxed_slice());
-        let doc = Document::from_source(ByteSource::Owned(owned));
+        let doc = Document::from_source(ByteSource::from_vec(bytes));
         let _ = tx.send(WorkerMsg::DocumentReady {
             window_id,
             doc,
@@ -96,8 +94,7 @@ pub fn spawn_parse_bytes(
 pub fn spawn_prettify(window_id: WindowId, source: ByteSource, tx: Sender<WorkerMsg>) {
     thread::spawn(move || {
         let pretty_bytes = pretty::prettify(source.as_slice());
-        let owned: Arc<[u8]> = Arc::<[u8]>::from(pretty_bytes.into_boxed_slice());
-        let doc = Document::from_source(ByteSource::Owned(owned));
+        let doc = Document::from_source(ByteSource::from_vec(pretty_bytes));
         let _ = tx.send(WorkerMsg::PrettyReady { window_id, doc });
     });
 }
@@ -107,7 +104,7 @@ fn load(path: &str) -> Result<Arc<Document>, String> {
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     // Empty files can't be mmaped on some platforms; fall back to Vec.
     let source = if metadata.len() == 0 {
-        ByteSource::Owned(Arc::<[u8]>::from(Vec::new().into_boxed_slice()))
+        ByteSource::from_vec(Vec::new())
     } else {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
         ByteSource::Mmap(Arc::new(mmap))

@@ -6,7 +6,6 @@
 //! `ByteSource` is cheaply cloneable — both variants are `Arc`-wrapped —
 //! so the worker thread and the main thread can share the same bytes.
 
-#![allow(dead_code)]
 
 use crate::parser::{self, ParseOutput};
 use memmap2::Mmap;
@@ -19,6 +18,10 @@ pub enum ByteSource {
 }
 
 impl ByteSource {
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        ByteSource::Owned(Arc::<[u8]>::from(v.into_boxed_slice()))
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ByteSource::Mmap(m) => m.as_ref(),
@@ -80,18 +83,10 @@ fn max_line_length(starts: &[u32], total: u32) -> u32 {
     if starts.is_empty() {
         return total;
     }
-    let mut max = 0u32;
-    for i in 0..starts.len() {
-        let a = starts[i];
-        let b = if i + 1 < starts.len() {
-            starts[i + 1].saturating_sub(1)
-        } else {
-            total
-        };
-        let len = b.saturating_sub(a);
-        if len > max {
-            max = len;
-        }
-    }
-    max
+    starts
+        .windows(2)
+        .map(|w| w[1].saturating_sub(1).saturating_sub(w[0]))
+        .chain(std::iter::once(total.saturating_sub(*starts.last().unwrap())))
+        .max()
+        .unwrap_or(0)
 }

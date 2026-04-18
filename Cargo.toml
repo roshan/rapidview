@@ -52,6 +52,7 @@ features = [
     "NSFontDescriptor",
     "NSFontManager",
     "NSButton",
+    "NSImage",
     "NSStackView",
     "NSLayoutConstraint",
     "NSLayoutAnchor",
@@ -63,6 +64,8 @@ features = [
     "NSAttributedString",
     "NSStringDrawing",
     "NSParagraphStyle",
+    "NSText",
+    "NSTextView",
 ]
 
 [dependencies.objc2-core-text]

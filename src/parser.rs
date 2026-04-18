@@ -11,7 +11,6 @@
 //! Lenient: on parse error the partial indexes are still returned, so the
 //! viewer can display broken files up to the point they go wrong.
 
-#![allow(dead_code)] // exercised from tests in T2; wired into UI in T3.
 
 use std::collections::HashMap;
 
@@ -76,6 +75,7 @@ impl KeyInterner {
         &self.buf[start as usize..(start + len) as usize]
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
@@ -142,17 +142,21 @@ pub struct ParseOutput {
     pub paths: PathIndex,
     pub styles: Vec<StyleSpan>,
     pub keys: KeyInterner,
+    #[allow(dead_code)] // inspected in tests and by callers
     pub error: Option<ParseError>,
+    #[allow(dead_code)]
     pub bytes: usize,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read via Debug formatting in error paths
 pub struct ParseError {
     pub offset: Offset,
     pub kind: ParseErrorKind,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // variants constructed by parser, read via Debug
 pub enum ParseErrorKind {
     UnexpectedByte(u8),
     UnexpectedEof,

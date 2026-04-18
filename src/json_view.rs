@@ -4,13 +4,7 @@
 //! so the document view is sized once (`line_count * line_height` tall,
 //! `max_line_bytes * advance` wide) and `drawRect:` reduces to picking a
 //! visible line range and drawing each one with CoreText.
-//!
-//! Phases:
-//!   * T3a — solid background (done)
-//!   * T3b — per-line draw with one colour (this turn)
-//!   * T3c — per-token colours from the style-span table
 
-#![allow(dead_code)]
 
 use crate::doc::Document;
 use crate::parser::{self, StyleKind, StyleSpan};
@@ -19,8 +13,8 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSAttributedStringNSStringDrawing, NSColor, NSEvent, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSTextField, NSView,
+    NSAttributedStringNSStringDrawing, NSColor, NSEvent, NSEventModifierFlags, NSFont,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSTextField, NSView,
 };
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableAttributedString, NSPoint, NSRange, NSRect, NSSize,
@@ -39,33 +33,39 @@ const FONT_SIZE: f64 = 13.0;
 /// larger than any realistic single JSON line.
 const MAX_LINE_BYTES_FOR_LAYOUT: f64 = 8_000.0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    Cursor,
-    ScrollLock,
+/// Search match state. Byte offsets into the current document.
+#[derive(Default)]
+pub struct SearchState {
+    /// Byte offset of each match start.
+    pub matches: Vec<u32>,
+    /// Length of the search query in bytes.
+    pub match_len: u32,
+    /// Index into `matches` of the "current" (focused) match.
+    pub current: usize,
 }
 
 pub struct JsonViewIvars {
     doc: RefCell<Option<Arc<Document>>>,
+    #[allow(dead_code)] // retained to keep the font alive for CoreText
     font: Retained<NSFont>,
     line_height: f64,
+    #[allow(dead_code)] // used implicitly via line_height calculation
     ascent: f64,
     /// Width of one monospace character ("M" advance).
     advance: f64,
     /// Pre-built attribute dictionary for the default text colour.
     default_attrs: Retained<NSDictionary<NSString>>,
     colors: Colors,
-    /// Per-view cursor vs scroll-lock selection. Tabs have independent
-    /// modes so a user can leave one tab scroll-locked while another is
-    /// in cursor mode.
-    mode: Cell<ViewMode>,
     /// Byte offset of the last click. None until the user clicks.
     last_click_offset: Cell<Option<u32>>,
     /// Breadcrumb label set by main.rs after the header bar is built.
     breadcrumb: RefCell<Option<Retained<NSTextField>>>,
+    /// Active search matches.
+    search: RefCell<SearchState>,
 }
 
 struct Colors {
+    #[allow(dead_code)] // retained; default_attrs references the underlying NSColor
     fg: Retained<NSColor>,
     bg: Retained<NSColor>,
     /// Background band drawn behind the line containing the last click.
@@ -75,6 +75,10 @@ struct Colors {
     number: Retained<NSColor>,
     bool_: Retained<NSColor>,
     null: Retained<NSColor>,
+    /// Background for non-current search matches.
+    search_match: Retained<NSColor>,
+    /// Background for the current (focused) search match.
+    search_current: Retained<NSColor>,
 }
 
 impl Colors {
@@ -116,15 +120,74 @@ define_class!(
             true
         }
 
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let flags = event.modifierFlags();
+            let has_cmd = flags.contains(NSEventModifierFlags::Command);
+            // Don't intercept keys with Cmd held — those are menu shortcuts.
+            if has_cmd {
+                return;
+            }
+            // Use characters() (not IgnoringModifiers) so Shift+G = "G"
+            // and Shift+4 = "$" are preserved.
+            let Some(chars) = event.characters() else { return };
+            let s = chars.to_string();
+            // Arrow keys (function key range) — check ignoring modifiers
+            // so they work regardless of input method.
+            let Some(raw) = event.charactersIgnoringModifiers() else { return };
+            let raw_s = raw.to_string();
+            match raw_s.as_str() {
+                "\u{f702}" => { self.move_cursor(0, -1); return; } // ←
+                "\u{f703}" => { self.move_cursor(0, 1); return; }  // →
+                "\u{f700}" => { self.move_cursor(-1, 0); return; } // ↑
+                "\u{f701}" => { self.move_cursor(1, 0); return; }  // ↓
+                _ => {}
+            }
+            match s.as_str() {
+                "h" => self.move_cursor(0, -1),
+                "l" => self.move_cursor(0, 1),
+                "k" => self.move_cursor(-1, 0),
+                "j" => self.move_cursor(1, 0),
+                "0" => self.move_cursor_bol(),
+                "$" => self.move_cursor_eol(),
+                "n" => {
+                    let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
+                    let _: () = unsafe {
+                        objc2::msg_send![&app, sendAction: objc2::sel!(rvSearchNext:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
+                    };
+                }
+                "N" => {
+                    let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
+                    let _: () = unsafe {
+                        objc2::msg_send![&app, sendAction: objc2::sel!(rvSearchPrev:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
+                    };
+                }
+                "g" => self.move_cursor_to(0, 0),
+                "G" => {
+                    let last = self.ivars().doc.borrow().as_ref()
+                        .map(|d| d.line_count().saturating_sub(1));
+                    if let Some(last) = last {
+                        self.move_cursor_to(last as i64, 0);
+                    }
+                }
+                "/" => {
+                    // Open search — send action up the responder chain.
+                    let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
+                    let _: () = unsafe {
+                        objc2::msg_send![&app, sendAction: objc2::sel!(rvShowSearch:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
+                    };
+                }
+                _ => {} // swallow — no beep
+            }
+        }
+
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let window_point = event.locationInWindow();
             let local = self.convertPoint_fromView(window_point, None);
             if let Some(offset) = self.point_to_byte_offset(local) {
                 self.ivars().last_click_offset.set(Some(offset));
-                if self.view_mode() == ViewMode::Cursor {
-                    self.refresh_path_display();
-                }
+                self.refresh_path_display();
                 // Repaint so the row-highlight band follows the click.
                 self.setNeedsDisplay(true);
             }
@@ -158,6 +221,8 @@ impl JsonView {
         let number = rgb(0.68, 0.50, 1.00);
         let bool_ = rgb(0.99, 0.59, 0.12);
         let null = rgb(0.97, 0.15, 0.45);
+        let search_match = rgb(0.55, 0.45, 0.10);
+        let search_current = rgb(0.85, 0.65, 0.10);
 
         let default_attrs = attribute_dict(&font, &fg);
 
@@ -177,10 +242,12 @@ impl JsonView {
                 number,
                 bool_,
                 null,
+                search_match,
+                search_current,
             },
-            mode: Cell::new(ViewMode::Cursor),
             last_click_offset: Cell::new(None),
             breadcrumb: RefCell::new(None),
+            search: RefCell::new(SearchState::default()),
         };
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -205,17 +272,163 @@ impl JsonView {
         self.setFrameSize(NSSize::new(min_w, min_h));
 
         *ivars.doc.borrow_mut() = Some(doc);
-        ivars.last_click_offset.set(None);
         self.setNeedsDisplay(true);
         self.refresh_path_display();
     }
 
-    pub fn view_mode(&self) -> ViewMode {
-        self.ivars().mode.get()
+    pub fn last_click_offset(&self) -> Option<u32> {
+        self.ivars().last_click_offset.get()
     }
 
-    pub fn set_view_mode(&self, m: ViewMode) {
-        self.ivars().mode.set(m);
+    pub fn set_last_click_offset(&self, offset: Option<u32>) {
+        self.ivars().last_click_offset.set(offset);
+    }
+
+    /// Run a case-insensitive search. Returns the match count.
+    pub fn search(&self, query: &str) -> usize {
+        let mut state = self.ivars().search.borrow_mut();
+        state.matches.clear();
+        state.current = 0;
+        state.match_len = 0;
+
+        if query.is_empty() {
+            drop(state);
+            self.setNeedsDisplay(true);
+            return 0;
+        }
+
+        let doc_ref = self.ivars().doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else {
+            return 0;
+        };
+
+        let haystack = doc.bytes.as_slice();
+        let needle = query.as_bytes();
+        let needle_lower: Vec<u8> = needle.iter().map(|b| b.to_ascii_lowercase()).collect();
+        state.match_len = needle_lower.len() as u32;
+
+        // Case-insensitive byte search, optimised with a first-byte
+        // skip so we don't call to_ascii_lowercase on every byte.
+        const MAX_MATCHES: usize = 100_000;
+        let nlen = needle_lower.len();
+        if nlen <= haystack.len() {
+            let first_lower = needle_lower[0];
+            let first_upper = first_lower.to_ascii_uppercase();
+            let mut i = 0;
+            let end = haystack.len() - nlen;
+            while i <= end {
+                // Skip to next candidate using the first byte.
+                let b = haystack[i];
+                if b != first_lower && b != first_upper {
+                    i += 1;
+                    continue;
+                }
+                if haystack[i..i + nlen]
+                    .iter()
+                    .zip(needle_lower.iter())
+                    .all(|(h, n)| h.to_ascii_lowercase() == *n)
+                {
+                    state.matches.push(i as u32);
+                    if state.matches.len() >= MAX_MATCHES {
+                        break;
+                    }
+                    i += nlen.max(1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let count = state.matches.len();
+        drop(state);
+        self.setNeedsDisplay(true);
+        count
+    }
+
+    /// Clear all search highlights.
+    pub fn clear_search(&self) {
+        let mut state = self.ivars().search.borrow_mut();
+        state.matches.clear();
+        state.current = 0;
+        state.match_len = 0;
+        drop(state);
+        self.setNeedsDisplay(true);
+    }
+
+    /// Move to the next match and scroll it into view. Returns new
+    /// (current_index, total) or None if no matches.
+    pub fn search_next(&self) -> Option<(usize, usize)> {
+        let mut state = self.ivars().search.borrow_mut();
+        if state.matches.is_empty() {
+            return None;
+        }
+        state.current = (state.current + 1) % state.matches.len();
+        let offset = state.matches[state.current];
+        let total = state.matches.len();
+        let idx = state.current;
+        drop(state);
+        self.ivars().last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+        Some((idx, total))
+    }
+
+    /// Move to the previous match and scroll it into view.
+    pub fn search_prev(&self) -> Option<(usize, usize)> {
+        let mut state = self.ivars().search.borrow_mut();
+        if state.matches.is_empty() {
+            return None;
+        }
+        if state.current == 0 {
+            state.current = state.matches.len() - 1;
+        } else {
+            state.current -= 1;
+        }
+        let offset = state.matches[state.current];
+        let total = state.matches.len();
+        let idx = state.current;
+        drop(state);
+        self.ivars().last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+        Some((idx, total))
+    }
+
+    /// Scroll to the current search match and update the breadcrumb.
+    pub fn scroll_to_current_match(&self) {
+        let search = self.ivars().search.borrow();
+        if let Some(&offset) = search.matches.get(search.current) {
+            drop(search);
+            self.ivars().last_click_offset.set(Some(offset));
+            self.scroll_to_byte_offset(offset);
+            self.refresh_path_display();
+        }
+    }
+
+    /// Scroll the enclosing scroll view so the byte offset is visible.
+    fn scroll_to_byte_offset(&self, offset: u32) {
+        let ivars = self.ivars();
+        let doc_ref = ivars.doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else { return };
+        let line_starts = &doc.output.line_starts;
+        let line = line_for_offset(offset, line_starts);
+        let col = if line < line_starts.len() {
+            let line_bytes = doc.line_bytes(line);
+            byte_offset_to_char_col(line_bytes, offset - line_starts[line]) as f64
+        } else {
+            0.0
+        };
+        drop(doc_ref);
+
+        let y = PAD_TOP + line as f64 * ivars.line_height;
+        let x = PAD_LEFT + col * ivars.advance;
+        let visible_rect = NSRect::new(
+            NSPoint::new(x.max(0.0) - 40.0, y - 40.0),
+            NSSize::new(200.0, ivars.line_height + 80.0),
+        );
+        self.scrollRectToVisible(visible_rect);
     }
 
     pub fn set_breadcrumb(&self, label: Retained<NSTextField>) {
@@ -240,24 +453,13 @@ impl JsonView {
         self.refresh_path_display();
     }
 
-    /// Byte offset that currently drives the breadcrumb, chosen by
-    /// `view_mode()`. Returns None if nothing has been clicked in cursor
-    /// mode; scroll-lock mode always returns the topmost visible line.
-    pub fn current_offset(&self) -> Option<u32> {
-        let ivars = self.ivars();
-        match self.view_mode() {
-            ViewMode::Cursor => ivars.last_click_offset.get(),
-            ViewMode::ScrollLock => self.viewport_top_offset(),
-        }
-    }
-
-    /// jq expression for the current offset. `.` when no offset exists.
+    /// jq expression for the last-clicked offset. `.` when nothing clicked.
     pub fn current_jq_expression(&self) -> String {
         let ivars = self.ivars();
         let Some(doc) = ivars.doc.borrow().as_ref().cloned() else {
             return String::from(".");
         };
-        let Some(offset) = self.current_offset() else {
+        let Some(offset) = ivars.last_click_offset.get() else {
             return String::from(".");
         };
         let Some(entry) = doc.output.paths.lookup(offset) else {
@@ -277,13 +479,103 @@ impl JsonView {
         }
     }
 
+    /// Move the cursor by a delta in lines and columns. Clamps to document
+    /// bounds. If no cursor exists yet, starts at (0, 0).
+    fn move_cursor(&self, dline: i64, dcol: i64) {
+        let ivars = self.ivars();
+        let doc_ref = ivars.doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else { return };
+        let line_starts = &doc.output.line_starts;
+        if line_starts.is_empty() {
+            return;
+        }
+
+        // Current position → line + col.
+        let (cur_line, cur_col) = match ivars.last_click_offset.get() {
+            Some(off) => {
+                let line = line_for_offset(off, line_starts);
+                let col = (off - line_starts[line]) as i64;
+                (line as i64, col)
+            }
+            None => (0i64, 0i64),
+        };
+
+        let new_line = (cur_line + dline).clamp(0, doc.line_count() as i64 - 1);
+        let line_bytes = doc.line_bytes(new_line as usize);
+        let max_col = line_bytes.len() as i64;
+        let new_col = (cur_col + dcol).clamp(0, max_col);
+
+        let offset = line_starts[new_line as usize] + new_col as u32;
+        drop(doc_ref);
+
+        ivars.last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+    }
+
+    /// Move cursor to the beginning of the current line.
+    fn move_cursor_bol(&self) {
+        let ivars = self.ivars();
+        let doc_ref = ivars.doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else { return };
+        let line_starts = &doc.output.line_starts;
+        let off = ivars.last_click_offset.get().unwrap_or(0);
+        let line = line_for_offset(off, line_starts);
+        let offset = line_starts[line];
+        drop(doc_ref);
+        ivars.last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+    }
+
+    /// Move cursor to the end of the current line.
+    fn move_cursor_eol(&self) {
+        let ivars = self.ivars();
+        let doc_ref = ivars.doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else { return };
+        let line_starts = &doc.output.line_starts;
+        let off = ivars.last_click_offset.get().unwrap_or(0);
+        let line = line_for_offset(off, line_starts);
+        let line_bytes = doc.line_bytes(line);
+        let offset = line_starts[line] + line_bytes.len() as u32;
+        drop(doc_ref);
+        ivars.last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+    }
+
+    /// Move the cursor to an absolute line and column.
+    fn move_cursor_to(&self, line: i64, col: i64) {
+        let ivars = self.ivars();
+        let doc_ref = ivars.doc.borrow();
+        let Some(doc) = doc_ref.as_ref() else { return };
+        let line_starts = &doc.output.line_starts;
+        if line_starts.is_empty() {
+            return;
+        }
+
+        let line = line.clamp(0, doc.line_count() as i64 - 1);
+        let line_bytes = doc.line_bytes(line as usize);
+        let col = col.clamp(0, line_bytes.len() as i64);
+        let offset = line_starts[line as usize] + col as u32;
+        drop(doc_ref);
+
+        ivars.last_click_offset.set(Some(offset));
+        self.scroll_to_byte_offset(offset);
+        self.refresh_path_display();
+        self.setNeedsDisplay(true);
+    }
+
     fn point_to_byte_offset(&self, local: NSPoint) -> Option<u32> {
         let ivars = self.ivars();
         let doc = ivars.doc.borrow().as_ref().cloned()?;
         let line_h = ivars.line_height;
         let y = (local.y - PAD_TOP).max(0.0);
         let line_idx = (y / line_h) as usize;
-        if line_idx >= doc.line_count() {
+        if line_idx >= doc.line_count() || doc.output.line_starts.is_empty() {
             return None;
         }
         let x = (local.x - PAD_LEFT).max(0.0);
@@ -303,20 +595,6 @@ impl JsonView {
             cnt += 1;
         }
         Some(doc.output.line_starts[line_idx] + byte_in_line as u32)
-    }
-
-    /// Byte offset of the first character on the line visible at the top
-    /// of the clip view. Used by scroll-lock mode.
-    fn viewport_top_offset(&self) -> Option<u32> {
-        let ivars = self.ivars();
-        let doc = ivars.doc.borrow().as_ref().cloned()?;
-        let visible = self.visibleRect();
-        let y = (visible.origin.y - PAD_TOP).max(0.0);
-        let line_idx = (y / ivars.line_height) as usize;
-        if line_idx >= doc.line_count() {
-            return None;
-        }
-        Some(doc.output.line_starts[line_idx])
     }
 
     fn draw_content(&self, dirty: NSRect) {
@@ -361,15 +639,93 @@ impl JsonView {
             }
         }
 
+        let adv = ivars.advance;
+
+        // Search match highlights — painted as background rects before text.
+        // For single-line files (minified JSON), thousands of matches may
+        // exist on the visible line range but most are off-screen
+        // horizontally. We restrict to matches whose byte offset falls
+        // within the visible column window to avoid O(all-matches) work.
+        let search = ivars.search.borrow();
+        if !search.matches.is_empty() {
+            let match_len = search.match_len;
+
+            // Byte range of the visible horizontal strip per line.
+            // On a 1-line file this is the key optimisation — we only
+            // paint the ~100 chars visible in the viewport.
+            let vis_col_start_f = ((dirty.origin.x - PAD_LEFT) / adv).floor().max(0.0);
+            let vis_col_end_f = ((dirty.origin.x + dirty.size.width - PAD_LEFT) / adv).ceil() + 2.0;
+
+            for line_idx in first..=last {
+                let l_start = line_starts[line_idx];
+                let line_bytes = doc.line_bytes(line_idx);
+                let line_str = std::str::from_utf8(line_bytes).unwrap_or("");
+
+                // Convert visible columns to byte offsets within this line.
+                let (clip_byte_start, clip_byte_end) = char_range_to_byte_range(
+                    line_str,
+                    vis_col_start_f as usize,
+                    vis_col_end_f as usize,
+                );
+                let abs_clip_start = l_start + clip_byte_start as u32;
+                let abs_clip_end = l_start + clip_byte_end as u32;
+
+                // Binary search for matches overlapping the visible byte window.
+                let lo = search.matches.partition_point(|&m| m + match_len <= abs_clip_start);
+                let hi = search.matches.partition_point(|&m| m < abs_clip_end);
+
+                for idx in lo..hi {
+                    let m_start = search.matches[idx];
+                    let m_end = m_start + match_len;
+                    let color = if idx == search.current {
+                        &ivars.colors.search_current
+                    } else {
+                        &ivars.colors.search_match
+                    };
+                    let byte_start = m_start.max(l_start) - l_start;
+                    let byte_end = m_end.min(l_start + line_bytes.len() as u32) - l_start;
+                    let char_start = byte_offset_to_char_col(
+                        &line_bytes[..clip_byte_end.min(line_bytes.len())],
+                        byte_start,
+                    );
+                    let char_end = byte_offset_to_char_col(
+                        &line_bytes[..clip_byte_end.min(line_bytes.len())],
+                        byte_end,
+                    );
+                    let x = PAD_LEFT + char_start as f64 * adv;
+                    let w = (char_end - char_start) as f64 * adv;
+                    let y = PAD_TOP + line_idx as f64 * line_h;
+                    let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, line_h));
+                    color.setFill();
+                    objc2_app_kit::NSRectFill(rect);
+                }
+            }
+        }
+        drop(search);
+
+        // Visible column range — for monospace we can convert the dirty
+        // rect's x span to a character range and only create an
+        // NSAttributedString for that slice. Without this, a single
+        // 11 MB minified line would beach-ball the renderer.
+        let vis_col_start = ((dirty.origin.x - PAD_LEFT) / adv).floor().max(0.0) as usize;
+        // Extra margin so partial glyphs at the edges aren't clipped.
+        let vis_col_end = ((dirty.origin.x + dirty.size.width - PAD_LEFT) / adv).ceil() as usize + 2;
+
         for line_idx in first..=last {
             let line_start_byte = line_starts[line_idx];
-            let bytes = doc.line_bytes(line_idx);
-            let s = std::str::from_utf8(bytes).unwrap_or("");
-            if s.is_empty() {
+            let full_bytes = doc.line_bytes(line_idx);
+            let full_str = std::str::from_utf8(full_bytes).unwrap_or("");
+            if full_str.is_empty() {
                 continue;
             }
-            let ns_str = NSString::from_str(s);
-            // Mutable so we can paint per-token colours onto the default.
+
+            // Clip to visible columns. Walk chars to find byte offsets
+            // since the string may contain multi-byte UTF-8.
+            let (clip_byte_start, clip_byte_end) =
+                char_range_to_byte_range(full_str, vis_col_start, vis_col_end);
+            let clipped = &full_str[clip_byte_start..clip_byte_end];
+
+            let ns_str = NSString::from_str(clipped);
             let attr_str = unsafe {
                 NSMutableAttributedString::initWithString_attributes(
                     NSMutableAttributedString::alloc(),
@@ -378,23 +734,50 @@ impl JsonView {
                 )
             };
 
-            // Paint tokens that intersect this line. Spans are in emit
-            // order = byte order, so a range lookup is two binary searches.
-            let line_byte_len = bytes.len() as u32;
-            let line_end_byte = line_start_byte + line_byte_len;
-            let lo = styles.partition_point(|sp| sp.end <= line_start_byte);
-            let hi = styles.partition_point(|sp| sp.start < line_end_byte);
-            if lo == hi {
-                // Still a valid line, just no coloured tokens.
-            } else {
-                paint_spans(&attr_str, s, line_start_byte, &styles[lo..hi], &ivars.colors);
+            // Style spans use absolute byte offsets. Shift the clip
+            // window into absolute coordinates for the binary search,
+            // then pass the clipped substring and its absolute start
+            // to paint_spans so it can translate back.
+            let abs_clip_start = line_start_byte + clip_byte_start as u32;
+            let abs_clip_end = line_start_byte + clip_byte_end as u32;
+            let lo = styles.partition_point(|sp| sp.end <= abs_clip_start);
+            let hi = styles.partition_point(|sp| sp.start < abs_clip_end);
+            if lo < hi {
+                paint_spans(&attr_str, clipped, abs_clip_start, &styles[lo..hi], &ivars.colors);
             }
 
             let y = PAD_TOP + line_idx as f64 * line_h;
-            let pt = NSPoint::new(PAD_LEFT, y);
+            let x = PAD_LEFT + vis_col_start as f64 * adv;
+            let pt = NSPoint::new(x, y);
             attr_str.drawAtPoint(pt);
         }
     }
+}
+
+/// Convert a byte offset within a UTF-8 string to a character (column) count.
+fn byte_offset_to_char_col(s: &[u8], byte_off: u32) -> u32 {
+    let clamped = (byte_off as usize).min(s.len());
+    std::str::from_utf8(&s[..clamped])
+        .map(|sl| sl.chars().count() as u32)
+        .unwrap_or(clamped as u32)
+}
+
+/// Convert a visible column range (char indices) to byte offsets in `s`.
+/// Clamps to the string length.
+fn char_range_to_byte_range(s: &str, col_start: usize, col_end: usize) -> (usize, usize) {
+    let mut byte_start = s.len();
+    let byte_end;
+    for (i, (byte_off, _)) in s.char_indices().enumerate() {
+        if i == col_start {
+            byte_start = byte_off;
+        }
+        if i == col_end {
+            byte_end = byte_off;
+            return (byte_start, byte_end);
+        }
+    }
+    // col_end >= char count — clamp to string end.
+    (byte_start.min(s.len()), s.len())
 }
 
 fn paint_spans(
@@ -492,17 +875,7 @@ fn line_for_offset(offset: u32, starts: &[u32]) -> usize {
     if starts.is_empty() {
         return 0;
     }
-    let mut lo = 0usize;
-    let mut hi = starts.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if starts[mid] <= offset {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo.saturating_sub(1)
+    starts.partition_point(|&s| s <= offset).saturating_sub(1)
 }
 
 #[cfg(test)]

@@ -17,21 +17,23 @@ mod parser;
 mod pretty;
 mod worker;
 
-use json_view::{JsonView, ViewMode};
+use json_view::JsonView;
+use objc2_app_kit::{NSControlTextEditingDelegate, NSTextFieldDelegate};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSBorderType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSLayoutConstraint,
+    NSBorderType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSImage,
+    NSImageSymbolConfiguration, NSImageSymbolScale, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponse,
     NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSScrollView, NSStackView,
     NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSView,
-    NSViewBoundsDidChangeNotification, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
     NSWindowTabbingMode,
 };
 use objc2_foundation::{
-    NSArray, NSEdgeInsets, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
+    NSArray, NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol,
     NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
 };
 use worker::{WindowId, WorkerChannel, WorkerMsg};
@@ -43,7 +45,7 @@ mod app_state {
     use crate::json_view::JsonView;
     use crate::worker::{WindowId, WorkerChannel};
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSButton, NSTextField, NSWindow};
+    use objc2_app_kit::{NSButton, NSStackView, NSTextField, NSWindow};
     use objc2_foundation::NSTimer;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -52,20 +54,49 @@ mod app_state {
 
     /// Per-tab state. Stays in the `WINDOWS` map for the lifetime of
     /// the window and is dropped by the `windowWillClose:` hook.
+    /// Cursor + scroll position saved when switching between original
+    /// and pretty views so each remembers where the user was.
+    #[derive(Default, Clone)]
+    pub struct SavedViewport {
+        pub click_offset: Option<u32>,
+        pub scroll_origin: (f64, f64),
+    }
+
     pub struct WindowState {
         pub window: Retained<NSWindow>,
         pub json_view: Retained<JsonView>,
-        pub mode_button: Retained<NSButton>,
         pub prettify_button: Retained<NSButton>,
         /// Kept alive so the view's weak reference to the breadcrumb
         /// label stays valid for the window's lifetime.
         #[allow(dead_code)]
         pub breadcrumb: Retained<NSTextField>,
+        pub search_field: Retained<NSTextField>,
+        pub search_count_label: Retained<NSTextField>,
+        pub search_bar: Retained<NSStackView>,
         pub current_path: Option<String>,
         pub original_doc: Option<Arc<Document>>,
         pub pretty_doc: Option<Arc<Document>>,
         pub is_pretty: bool,
         pub pretty_pending: bool,
+        pub saved_original: SavedViewport,
+        pub saved_pretty: SavedViewport,
+    }
+
+    impl WindowState {
+        /// Reset document state back to blank. Used by clear, paste, and
+        /// load-file to avoid repeating the same five field assignments.
+        pub fn reset_doc_state(&mut self) {
+            self.original_doc = None;
+            self.pretty_doc = None;
+            self.is_pretty = false;
+            self.pretty_pending = false;
+            self.saved_original = SavedViewport::default();
+            self.saved_pretty = SavedViewport::default();
+            self.json_view.set_last_click_offset(None);
+            self.json_view.clear_search();
+            self.prettify_button
+                .setTitle(&objc2_foundation::NSString::from_str("Prettify"));
+        }
     }
 
     thread_local! {
@@ -89,6 +120,17 @@ fn window_id_of(w: &NSWindow) -> WindowId {
     (w as *const NSWindow) as WindowId
 }
 
+fn with_window<R>(id: WindowId, f: impl FnOnce(&app_state::WindowState) -> R) -> Option<R> {
+    app_state::WINDOWS.with(|m| m.borrow().get(&id).map(f))
+}
+
+fn with_window_mut<R>(
+    id: WindowId,
+    f: impl FnOnce(&mut app_state::WindowState) -> R,
+) -> Option<R> {
+    app_state::WINDOWS.with(|m| m.borrow_mut().get_mut(&id).map(f))
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -96,16 +138,20 @@ define_class!(
     struct AppDelegate;
 
     unsafe impl NSObjectProtocol for AppDelegate {}
+    unsafe impl NSControlTextEditingDelegate for AppDelegate {}
+    unsafe impl NSTextFieldDelegate for AppDelegate {}
 
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
             install_menu_bar(mtm);
-            install_scroll_observer(self);
-            // Always create one window up front. Argv files load into
-            // it (first) or new tabs (subsequent).
-            new_window(mtm, self);
+            // If openURLs already fired (it can on some launch paths),
+            // don't create a duplicate blank window.
+            let has_windows = app_state::WINDOWS.with(|m| !m.borrow().is_empty());
+            if !has_windows {
+                new_window(mtm, self);
+            }
             for arg in std::env::args().skip(1) {
                 if arg.starts_with('-') {
                     continue;
@@ -164,13 +210,6 @@ define_class!(
             show_open_panel(mtm, self);
         }
 
-        #[unsafe(method(rvToggleMode:))]
-        fn rv_toggle_mode(&self, sender: &NSButton) {
-            if let Some(id) = window_id_from_button(sender) {
-                toggle_mode(id);
-            }
-        }
-
         #[unsafe(method(rvTogglePrettify:))]
         fn rv_toggle_prettify(&self, sender: &NSButton) {
             if let Some(id) = window_id_from_button(sender) {
@@ -204,26 +243,88 @@ define_class!(
             drain_worker();
         }
 
-        #[unsafe(method(rvClipDidScroll:))]
-        fn rv_clip_did_scroll(&self, notif: &NSNotification) {
-            // NSViewBoundsDidChangeNotification's object is always an
-            // NSView (per the notification contract). We only care
-            // about clip views inside our tabs — the WINDOWS map
-            // lookup filters out anything AppKit posts for its own
-            // internal views.
+        #[unsafe(method(rvShowSearch:))]
+        fn rv_show_search(&self, _sender: &AnyObject) {
+            let mtm = self.mtm();
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(win) = app.keyWindow() {
+                show_search(window_id_of(&win));
+            }
+        }
+
+        #[unsafe(method(rvSearchNext:))]
+        fn rv_search_next(&self, _sender: &AnyObject) {
+            let mtm = self.mtm();
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(win) = app.keyWindow() {
+                search_navigate(window_id_of(&win), true);
+            }
+        }
+
+        #[unsafe(method(rvSearchPrev:))]
+        fn rv_search_prev(&self, _sender: &AnyObject) {
+            let mtm = self.mtm();
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(win) = app.keyWindow() {
+                search_navigate(window_id_of(&win), false);
+            }
+        }
+
+        #[unsafe(method(rvDismissSearch:))]
+        fn rv_dismiss_search(&self, _sender: &AnyObject) {
+            let mtm = self.mtm();
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(win) = app.keyWindow() {
+                dismiss_search(window_id_of(&win));
+            }
+        }
+
+        /// Fired when the user presses Enter in the search field.
+        /// Shift+Enter → previous, Enter → next.
+        #[unsafe(method(rvSearchFieldAction:))]
+        fn rv_search_field_action(&self, sender: &NSTextField) {
+            if let Some(win) = sender.window() {
+                let id = window_id_of(&win);
+                // Enter commits the search regardless of query length.
+                force_search(id);
+                let event = NSApplication::sharedApplication(self.mtm()).currentEvent();
+                let shift = event
+                    .map(|e| e.modifierFlags().contains(NSEventModifierFlags::Shift))
+                    .unwrap_or(false);
+                search_navigate(id, !shift);
+            }
+        }
+
+        /// Intercept Escape in the search field's field editor.
+        /// Returning true means "I handled this command, don't beep."
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn control_text_view_do_command(
+            &self,
+            control: &objc2_app_kit::NSControl,
+            _text_view: &objc2_app_kit::NSTextView,
+            sel: objc2::runtime::Sel,
+        ) -> objc2::runtime::Bool {
+            if sel == objc2::sel!(cancelOperation:) {
+                if let Some(win) = control.window() {
+                    dismiss_search(window_id_of(&win));
+                }
+                return objc2::runtime::Bool::YES;
+            }
+            objc2::runtime::Bool::NO
+        }
+
+        #[unsafe(method(rvSearchChanged:))]
+        fn rv_search_changed(&self, notif: &NSNotification) {
+            // controlTextDidChange: — the notification's object is the
+            // NSTextField. Walk up to the window to find the tab.
             let Some(obj) = notif.object() else { return };
             let view_ptr = Retained::as_ptr(&obj) as *const NSView;
             let window = unsafe { (*view_ptr).window() };
             let Some(window) = window else { return };
             let id = window_id_of(&window);
-            app_state::WINDOWS.with(|m| {
-                if let Some(state) = m.borrow().get(&id) {
-                    if state.json_view.view_mode() == ViewMode::ScrollLock {
-                        state.json_view.refresh_path_display();
-                    }
-                }
-            });
+            run_search(id);
         }
+
     }
 );
 
@@ -235,24 +336,6 @@ impl AppDelegate {
 }
 
 // -- menu bar ---------------------------------------------------------
-
-/// Register one process-wide observer for clip-view bounds changes. The
-/// handler inspects the notification's object, finds its owning window,
-/// and refreshes scroll-locked tabs. Avoids per-window registrations
-/// that would otherwise dangle across tab close.
-fn install_scroll_observer(delegate: &AppDelegate) {
-    let delegate_obj = delegate as &AnyObject;
-    let center = NSNotificationCenter::defaultCenter();
-    unsafe {
-        let name: &NSString = NSViewBoundsDidChangeNotification;
-        center.addObserver_selector_name_object(
-            delegate_obj,
-            objc2::sel!(rvClipDidScroll:),
-            Some(name),
-            None, // any object — handler filters by window lookup
-        );
-    }
-}
 
 fn install_menu_bar(mtm: MainThreadMarker) {
     let menubar = NSMenu::new(mtm);
@@ -300,6 +383,36 @@ fn install_menu_bar(mtm: MainThreadMarker) {
         NSEventModifierFlags::Command,
     );
     file_menu_item.setSubmenu(Some(&file_menu));
+
+    // Edit menu: Find (Cmd+F), Find Next (Cmd+G), Find Previous (Shift+Cmd+G).
+    let edit_menu_item = NSMenuItem::new(mtm);
+    menubar.addItem(&edit_menu_item);
+    let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+    add_menu_item(
+        mtm,
+        &edit_menu,
+        "Find…",
+        objc2::sel!(rvShowSearch:),
+        "f",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &edit_menu,
+        "Find Next",
+        objc2::sel!(rvSearchNext:),
+        "g",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &edit_menu,
+        "Find Previous",
+        objc2::sel!(rvSearchPrev:),
+        "g",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+    );
+    edit_menu_item.setSubmenu(Some(&edit_menu));
 
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menubar));
@@ -362,8 +475,6 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         ProtocolObject::from_ref(delegate);
     window.setDelegate(Some(delegate_proto));
 
-    // Observer for scroll-lock — registered per-window so we can tear
-    // it down with the window.
     let content_view = window.contentView().expect("window has content view");
     let content_bounds = content_view.bounds();
 
@@ -377,12 +488,31 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     scroll.setDocumentView(Some(&json_view));
 
     let delegate_obj = delegate as &AnyObject;
-    let (header, breadcrumb_label, mode_button, prettify_button) =
-        build_header_bar(mtm, delegate_obj);
-    json_view.set_breadcrumb(breadcrumb_label.clone());
+    let hb = build_header_bar(mtm, delegate_obj);
+    json_view.set_breadcrumb(hb.breadcrumb.clone());
 
-    let stack_views: Retained<NSArray<NSView>> =
-        NSArray::from_slice(&[&*header as &NSView, &*scroll as &NSView]);
+    // Set the delegate on the search field so control:textView:doCommandBySelector:
+    // fires for Escape handling, and register for live-as-you-type search.
+    {
+        let tf_delegate: &ProtocolObject<dyn objc2_app_kit::NSTextFieldDelegate> =
+            ProtocolObject::from_ref(delegate);
+        unsafe { hb.search_field.setDelegate(Some(tf_delegate)) };
+    }
+    let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+    unsafe {
+        center.addObserver_selector_name_object(
+            delegate_obj,
+            objc2::sel!(rvSearchChanged:),
+            Some(objc2_app_kit::NSControlTextDidChangeNotification),
+            Some(&hb.search_field),
+        );
+    }
+
+    let stack_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
+        &*hb.stack as &NSView,
+        &*hb.search_bar as &NSView,
+        &*scroll as &NSView,
+    ]);
     let stack = NSStackView::stackViewWithViews(&stack_views, mtm);
     stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     stack.setSpacing(0.0);
@@ -407,55 +537,59 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     ]);
     NSLayoutConstraint::activateConstraints(&constraints);
 
-    // Scroll-lock observer: the clip view has to post bounds-change
-    // notifications, but the observer registration itself lives at
-    // process scope (see install_scroll_observer) so closing a tab
-    // never leaves behind a dangling per-window registration.
-    let clip_view = scroll.contentView();
-    clip_view.setPostsBoundsChangedNotifications(true);
-
     window.makeKeyAndOrderFront(None);
 
     let id = window_id_of(&window);
     let state = app_state::WindowState {
         window,
         json_view,
-        mode_button,
-        prettify_button,
-        breadcrumb: breadcrumb_label,
+        prettify_button: hb.prettify_button,
+        breadcrumb: hb.breadcrumb,
+        search_field: hb.search_field,
+        search_count_label: hb.search_count_label,
+        search_bar: hb.search_bar,
         current_path: None,
         original_doc: None,
         pretty_doc: None,
         is_pretty: false,
         pretty_pending: false,
+        saved_original: app_state::SavedViewport::default(),
+        saved_pretty: app_state::SavedViewport::default(),
     };
     app_state::WINDOWS.with(|m| {
         m.borrow_mut().insert(id, state);
     });
-    update_mode_button_title(id);
     id
+}
+
+struct HeaderBar {
+    stack: Retained<NSStackView>,
+    breadcrumb: Retained<NSTextField>,
+    prettify_button: Retained<NSButton>,
+    search_field: Retained<NSTextField>,
+    search_count_label: Retained<NSTextField>,
+    search_bar: Retained<NSStackView>,
 }
 
 fn build_header_bar(
     mtm: MainThreadMarker,
     target: &AnyObject,
-) -> (
-    Retained<NSStackView>,
-    Retained<NSTextField>,
-    Retained<NSButton>,
-    Retained<NSButton>,
-) {
+) -> HeaderBar {
     let cmd = NSEventModifierFlags::Command;
-    let clipboard_button = make_button(mtm, "Clipboard", target, objc2::sel!(rvPasteJson:));
+    let clipboard_button =
+        make_icon_button(mtm, "doc.on.clipboard", "Paste from clipboard", target, objc2::sel!(rvPasteJson:));
     set_key(&clipboard_button, "v", cmd);
-    let clear_button = make_button(mtm, "Clear", target, objc2::sel!(rvClearDocument:));
+    clipboard_button.setToolTip(Some(&NSString::from_str("Paste JSON from clipboard (⌘V)")));
+    let clear_button =
+        make_icon_button(mtm, "xmark.circle", "Clear document", target, objc2::sel!(rvClearDocument:));
     set_key(&clear_button, "k", cmd);
-    let mode_button = make_button(mtm, "Cursor", target, objc2::sel!(rvToggleMode:));
-    set_key(&mode_button, "l", cmd);
+    clear_button.setToolTip(Some(&NSString::from_str("Clear document (⌘K)")));
     let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
+    prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
     let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
     set_key(&copy_button, "c", cmd);
+    copy_button.setToolTip(Some(&NSString::from_str("Copy jq path to clipboard (⌘C)")));
 
     let label = {
         let s = NSString::from_str(".");
@@ -470,7 +604,6 @@ fn build_header_bar(
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
         &*clipboard_button as &NSView,
         &*clear_button as &NSView,
-        &*mode_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
         &*copy_button as &NSView,
@@ -492,7 +625,45 @@ fn build_header_bar(
         NSLayoutConstraintOrientation::Horizontal,
     );
 
-    (header, label, mode_button, prettify_button)
+    // Search bar — hidden until Cmd+F. Contains a text field and a
+    // match-count label, arranged horizontally.
+    let search_field = {
+        let tf = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+        tf.setFont(Some(&NSFont::userFixedPitchFontOfSize(12.0).unwrap()));
+        tf.setPlaceholderString(Some(&NSString::from_str("Search… (Enter=next, Esc=close)")));
+        // Width constraint so it doesn't collapse.
+        let wc = tf.widthAnchor().constraintGreaterThanOrEqualToConstant(240.0);
+        wc.setActive(true);
+        // Enter in the search field navigates to the next match.
+        unsafe {
+            tf.setAction(Some(objc2::sel!(rvSearchFieldAction:)));
+            tf.setTarget(Some(target));
+        }
+        tf
+    };
+    let search_count = {
+        let tf = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        tf.setFont(Some(&NSFont::userFixedPitchFontOfSize(11.0).unwrap()));
+        tf.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        tf
+    };
+    let search_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
+        &*search_field as &NSView,
+        &*search_count as &NSView,
+    ]);
+    let search_bar = NSStackView::stackViewWithViews(&search_views, mtm);
+    search_bar.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+    search_bar.setSpacing(6.0);
+    search_bar.setHidden(true);
+
+    HeaderBar {
+        stack: header,
+        breadcrumb: label,
+        prettify_button,
+        search_field,
+        search_count_label: search_count,
+        search_bar,
+    }
 }
 
 fn make_button(
@@ -509,6 +680,30 @@ fn make_button(
     btn
 }
 
+fn make_icon_button(
+    mtm: MainThreadMarker,
+    symbol_name: &str,
+    accessibility_label: &str,
+    target: &AnyObject,
+    action: objc2::runtime::Sel,
+) -> Retained<NSButton> {
+    let base_image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol_name),
+        Some(&NSString::from_str(accessibility_label)),
+    )
+    .expect("SF Symbol should be available");
+    let small_config =
+        NSImageSymbolConfiguration::configurationWithScale(NSImageSymbolScale::Small);
+    let image = base_image
+        .imageWithSymbolConfiguration(&small_config)
+        .unwrap_or(base_image);
+    let btn = unsafe {
+        NSButton::buttonWithImage_target_action(&image, Some(target), Some(action), mtm)
+    };
+    btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Toolbar);
+    btn
+}
+
 fn set_key(btn: &NSButton, key: &str, modifiers: NSEventModifierFlags) {
     btn.setKeyEquivalent(&NSString::from_str(key));
     btn.setKeyEquivalentModifierMask(modifiers);
@@ -521,25 +716,17 @@ fn window_id_from_button(btn: &NSButton) -> Option<WindowId> {
     Some(window_id_of(&win))
 }
 
-/// Reuse the current key window if it's empty; otherwise create a new
-/// tab. Matches the "first-file-into-the-blank-tab" launch experience.
+/// Reuse any blank window (no document loaded); otherwise create a new
+/// tab. Checks all windows, not just the key window, because
+/// `application:openURLs:` can fire before the key window is set.
 fn find_or_create_tab_for_load(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
-    let key_window_id = {
-        let app = NSApplication::sharedApplication(mtm);
-        app.keyWindow().map(|w| window_id_of(&w))
-    };
-    if let Some(id) = key_window_id {
-        let is_blank = app_state::WINDOWS.with(|m| {
-            m.borrow()
-                .get(&id)
-                .map(|s| s.original_doc.is_none() && s.current_path.is_none())
-                .unwrap_or(false)
-        });
-        if is_blank {
-            return id;
-        }
-    }
-    new_window(mtm, delegate)
+    let blank = app_state::WINDOWS.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(_, s)| s.original_doc.is_none() && s.current_path.is_none())
+            .map(|(&id, _)| id)
+    });
+    blank.unwrap_or_else(|| new_window(mtm, delegate))
 }
 
 fn show_open_panel(mtm: MainThreadMarker, delegate: &AppDelegate) {
@@ -565,17 +752,11 @@ fn show_open_panel(mtm: MainThreadMarker, delegate: &AppDelegate) {
 // -- per-window actions ----------------------------------------------
 
 fn clear_view(id: WindowId) {
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow_mut().get_mut(&id) {
-            state.original_doc = None;
-            state.pretty_doc = None;
-            state.current_path = None;
-            state.is_pretty = false;
-            state.pretty_pending = false;
-            state.prettify_button.setTitle(&NSString::from_str("Prettify"));
-            state.window.setTitle(&NSString::from_str("Rapid View"));
-            state.json_view.clear_document();
-        }
+    with_window_mut(id, |state| {
+        state.reset_doc_state();
+        state.current_path = None;
+        state.window.setTitle(&NSString::from_str("Rapid View"));
+        state.json_view.clear_document();
     });
 }
 
@@ -596,18 +777,12 @@ fn paste_from_clipboard(id: WindowId) {
     }
 
     let label = "<clipboard>".to_string();
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow_mut().get_mut(&id) {
-            state.is_pretty = false;
-            state.pretty_pending = false;
-            state.pretty_doc = None;
-            state.original_doc = None;
-            state.current_path = Some(label.clone());
-            state
-                .window
-                .setTitle(&NSString::from_str("Rapid View — parsing clipboard…"));
-            state.prettify_button.setTitle(&NSString::from_str("Prettify"));
-        }
+    with_window_mut(id, |state| {
+        state.reset_doc_state();
+        state.current_path = Some(label.clone());
+        state
+            .window
+            .setTitle(&NSString::from_str("Rapid View — parsing clipboard…"));
     });
 
     let tx = ensure_worker_channel();
@@ -618,18 +793,12 @@ fn paste_from_clipboard(id: WindowId) {
 
 fn load_file_into_window(id: WindowId, path: &str) {
     let name = basename(path);
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow_mut().get_mut(&id) {
-            state.is_pretty = false;
-            state.pretty_pending = false;
-            state.pretty_doc = None;
-            state.original_doc = None;
-            state.current_path = Some(path.to_string());
-            state
-                .window
-                .setTitle(&NSString::from_str(&format!("Rapid View — loading {}…", name)));
-            state.prettify_button.setTitle(&NSString::from_str("Prettify"));
-        }
+    with_window_mut(id, |state| {
+        state.reset_doc_state();
+        state.current_path = Some(path.to_string());
+        state
+            .window
+            .setTitle(&NSString::from_str(&format!("Rapid View — loading {}…", name)));
     });
 
     let tx = ensure_worker_channel();
@@ -638,39 +807,8 @@ fn load_file_into_window(id: WindowId, path: &str) {
     ensure_poll_timer();
 }
 
-fn toggle_mode(id: WindowId) {
-    app_state::WINDOWS.with(|m| {
-        let borrow = m.borrow();
-        let Some(state) = borrow.get(&id) else { return };
-        let next = match state.json_view.view_mode() {
-            ViewMode::Cursor => ViewMode::ScrollLock,
-            ViewMode::ScrollLock => ViewMode::Cursor,
-        };
-        state.json_view.set_view_mode(next);
-        state.json_view.refresh_path_display();
-    });
-    update_mode_button_title(id);
-}
-
-fn update_mode_button_title(id: WindowId) {
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow().get(&id) {
-            let title = match state.json_view.view_mode() {
-                ViewMode::Cursor => "Cursor",
-                ViewMode::ScrollLock => "Scroll-lock",
-            };
-            state.mode_button.setTitle(&NSString::from_str(title));
-        }
-    });
-}
-
 fn copy_jq(id: WindowId) {
-    let expr = app_state::WINDOWS.with(|m| {
-        m.borrow()
-            .get(&id)
-            .map(|s| s.json_view.current_jq_expression())
-            .unwrap_or_else(|| String::from("."))
-    });
+    let expr = with_window(id, |s| s.json_view.current_jq_expression()).unwrap_or_else(|| String::from("."));
     let pb = NSPasteboard::generalPasteboard();
     pb.clearContents();
     let ns = NSString::from_str(&expr);
@@ -683,6 +821,135 @@ fn copy_jq(id: WindowId) {
     eprintln!("copied jq: {}", expr);
 }
 
+/// Capture the current scroll position + cursor offset from the view.
+fn save_viewport(state: &app_state::WindowState) -> app_state::SavedViewport {
+    let click = state.json_view.last_click_offset();
+    let scroll = state
+        .json_view
+        .enclosingScrollView()
+        .map(|sv| {
+            let bounds = sv.contentView().bounds();
+            (bounds.origin.x, bounds.origin.y)
+        })
+        .unwrap_or((0.0, 0.0));
+    app_state::SavedViewport {
+        click_offset: click,
+        scroll_origin: scroll,
+    }
+}
+
+/// Restore a previously saved scroll position + cursor offset.
+fn restore_viewport(state: &app_state::WindowState, saved: &app_state::SavedViewport) {
+    state.json_view.set_last_click_offset(saved.click_offset);
+    if let Some(sv) = state.json_view.enclosingScrollView() {
+        let clip = sv.contentView();
+        // Clamp scroll position to the document bounds so we don't
+        // end up staring at blank space (e.g. switching from a wide
+        // minified view to a narrow pretty-printed one).
+        let doc_frame = state.json_view.frame();
+        let clip_size = clip.bounds().size;
+        let max_x = (doc_frame.size.width - clip_size.width).max(0.0);
+        let max_y = (doc_frame.size.height - clip_size.height).max(0.0);
+        let x = saved.scroll_origin.0.clamp(0.0, max_x);
+        let y = saved.scroll_origin.1.clamp(0.0, max_y);
+        clip.setBoundsOrigin(NSPoint::new(x, y));
+    }
+}
+
+// -- search -----------------------------------------------------------
+
+fn show_search(id: WindowId) {
+    with_window(id, |state| {
+        state.search_bar.setHidden(false);
+        state.window.makeFirstResponder(Some(&state.search_field));
+    });
+}
+
+fn dismiss_search(id: WindowId) {
+    with_window(id, |state| {
+        state.search_bar.setHidden(true);
+        state.search_field.setStringValue(&NSString::from_str(""));
+        state.search_count_label.setStringValue(&NSString::from_str(""));
+        state.json_view.clear_search();
+        state.window.makeFirstResponder(Some(&state.json_view));
+    });
+}
+
+fn run_search(id: WindowId) {
+    with_window(id, |state| {
+        let query = state.search_field.stringValue().to_string();
+        // Don't run incremental search until 4+ chars to avoid
+        // scanning large files on every keystroke for short queries.
+        if query.len() < 4 {
+            state.json_view.clear_search();
+            let label = if query.is_empty() {
+                String::new()
+            } else {
+                "Type 4+ chars…".to_string()
+            };
+            state.search_count_label.setStringValue(&NSString::from_str(&label));
+            return;
+        }
+        let count = state.json_view.search(&query);
+        let label = if count == 0 {
+            "No matches".to_string()
+        } else {
+            state.json_view.scroll_to_current_match();
+            if count >= 100_000 {
+                "100,000+ matches".to_string()
+            } else {
+                format!("1 of {}", count)
+            }
+        };
+        state.search_count_label.setStringValue(&NSString::from_str(&label));
+    });
+}
+
+/// Re-run the active search against the current document (e.g. after
+/// switching between original and pretty). No-op if the search bar is hidden.
+fn rerun_search(id: WindowId) {
+    let active = with_window(id, |s| !s.search_bar.isHidden()).unwrap_or(false);
+    if active {
+        run_search(id);
+    }
+}
+
+/// Run search unconditionally (ignoring the 4-char threshold). Used
+/// when the user presses Enter to commit a short query.
+fn force_search(id: WindowId) {
+    with_window(id, |state| {
+        let query = state.search_field.stringValue().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let count = state.json_view.search(&query);
+        let label = if count == 0 {
+            "No matches".to_string()
+        } else if count >= 100_000 {
+            "100,000+ matches".to_string()
+        } else {
+            format!("1 of {}", count)
+        };
+        state.search_count_label.setStringValue(&NSString::from_str(&label));
+    });
+}
+
+fn search_navigate(id: WindowId, forward: bool) {
+    with_window(id, |state| {
+        let result = if forward {
+            state.json_view.search_next()
+        } else {
+            state.json_view.search_prev()
+        };
+        if let Some((idx, total)) = result {
+            let label = format!("{} of {}", idx + 1, total);
+            state.search_count_label.setStringValue(&NSString::from_str(&label));
+        }
+    });
+}
+
+// -- prettify ---------------------------------------------------------
+
 fn toggle_prettify(id: WindowId) {
     // Decide what to do under a short borrow; anything that calls into
     // the view or spawns workers happens after the borrow drops.
@@ -693,11 +960,7 @@ fn toggle_prettify(id: WindowId) {
         Nothing,
     }
 
-    let action = app_state::WINDOWS.with(|m| {
-        let borrow = m.borrow();
-        let Some(state) = borrow.get(&id) else {
-            return Action::Nothing;
-        };
+    let action = with_window(id, |state| {
         if state.is_pretty {
             return state
                 .original_doc
@@ -713,40 +976,44 @@ fn toggle_prettify(id: WindowId) {
             .as_ref()
             .map(|d| Action::SpawnPretty(d.bytes.clone()))
             .unwrap_or(Action::Nothing)
-    });
+    })
+    .unwrap_or(Action::Nothing);
 
     match action {
         Action::Nothing => {}
         Action::SwapToOriginal(doc) => {
-            app_state::WINDOWS.with(|m| {
-                if let Some(state) = m.borrow_mut().get_mut(&id) {
-                    state.is_pretty = false;
-                    state.json_view.set_document(doc);
-                    state.prettify_button.setTitle(&NSString::from_str("Prettify"));
-                    refresh_title(state);
-                }
+            with_window_mut(id, |state| {
+                state.saved_pretty = save_viewport(state);
+                state.is_pretty = false;
+                state.json_view.set_document(doc);
+                let saved = state.saved_original.clone();
+                restore_viewport(state, &saved);
+                state.prettify_button.setTitle(&NSString::from_str("Prettify"));
+                refresh_title(state);
             });
+            rerun_search(id);
         }
         Action::SwapToCachedPretty(doc) => {
-            app_state::WINDOWS.with(|m| {
-                if let Some(state) = m.borrow_mut().get_mut(&id) {
-                    state.is_pretty = true;
-                    state.json_view.set_document(doc);
-                    state.prettify_button.setTitle(&NSString::from_str("Original"));
-                    refresh_title(state);
-                }
+            with_window_mut(id, |state| {
+                state.saved_original = save_viewport(state);
+                state.is_pretty = true;
+                state.json_view.set_document(doc);
+                let saved = state.saved_pretty.clone();
+                restore_viewport(state, &saved);
+                state.prettify_button.setTitle(&NSString::from_str("Original"));
+                refresh_title(state);
             });
+            rerun_search(id);
         }
         Action::SpawnPretty(source) => {
-            app_state::WINDOWS.with(|m| {
-                if let Some(state) = m.borrow_mut().get_mut(&id) {
-                    state.is_pretty = true;
-                    state.pretty_pending = true;
-                    state.prettify_button.setTitle(&NSString::from_str("Original"));
-                    state
-                        .window
-                        .setTitle(&NSString::from_str("Rapid View — prettifying…"));
-                }
+            with_window_mut(id, |state| {
+                state.saved_original = save_viewport(state);
+                state.is_pretty = true;
+                state.pretty_pending = true;
+                state.prettify_button.setTitle(&NSString::from_str("Original"));
+                state
+                    .window
+                    .setTitle(&NSString::from_str("Rapid View — prettifying…"));
             });
             let tx = ensure_worker_channel();
             app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -817,22 +1084,18 @@ fn drain_worker() {
                 path,
             } => {
                 on_document_ready(window_id, doc, &path);
-                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             WorkerMsg::PrettyReady { window_id, doc } => {
                 on_pretty_ready(window_id, doc);
-                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             WorkerMsg::Error { window_id, message } => {
                 eprintln!("rapid-view: {}", message);
-                app_state::WINDOWS.with(|m| {
-                    if let Some(state) = m.borrow_mut().get_mut(&window_id) {
-                        state.window.setTitle(&NSString::from_str("Rapid View"));
-                    }
+                with_window_mut(window_id, |state| {
+                    state.window.setTitle(&NSString::from_str("Rapid View"));
                 });
-                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     if app_state::WORK_PENDING.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
@@ -849,34 +1112,33 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
     let size = doc.bytes.len();
     let lines = doc.line_count();
     eprintln!("loaded {} ({} bytes, {} lines)", path, size, lines);
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow_mut().get_mut(&id) {
-            state.original_doc = Some(doc.clone());
-            state.pretty_doc = None;
-            state.is_pretty = false;
-            state.current_path = Some(path.to_string());
-            state.json_view.set_document(doc);
-            state.prettify_button.setTitle(&NSString::from_str("Prettify"));
-            refresh_title(state);
-        }
+    with_window_mut(id, |state| {
+        state.reset_doc_state();
+        state.original_doc = Some(doc.clone());
+        state.current_path = Some(path.to_string());
+        state.json_view.set_document(doc);
+        refresh_title(state);
     });
 }
 
 fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
-    app_state::WINDOWS.with(|m| {
-        if let Some(state) = m.borrow_mut().get_mut(&id) {
-            state.pretty_doc = Some(doc.clone());
-            state.pretty_pending = false;
-            // If the user is still asking for pretty (set optimistically
-            // at click time), install it; otherwise keep the cache for
-            // the next toggle.
-            if state.is_pretty {
-                state.json_view.set_document(doc);
-                state.prettify_button.setTitle(&NSString::from_str("Original"));
-            }
-            refresh_title(state);
+    with_window_mut(id, |state| {
+        state.pretty_doc = Some(doc.clone());
+        state.pretty_pending = false;
+        // If the user is still asking for pretty (set optimistically
+        // at click time), install it; otherwise keep the cache for
+        // the next toggle.
+        if state.is_pretty {
+            state.json_view.set_document(doc);
+            // First prettify — scroll to top since the layout changed
+            // drastically (single minified line → many short lines).
+            let default_vp = app_state::SavedViewport::default();
+            restore_viewport(state, &default_vp);
+            state.prettify_button.setTitle(&NSString::from_str("Original"));
         }
+        refresh_title(state);
     });
+    rerun_search(id);
 }
 
 // -- misc helpers ----------------------------------------------------
