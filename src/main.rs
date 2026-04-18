@@ -218,29 +218,29 @@ define_class!(
         }
 
         #[unsafe(method(rvTogglePrettify:))]
-        fn rv_toggle_prettify(&self, sender: &NSButton) {
-            if let Some(id) = window_id_from_button(sender) {
+        fn rv_toggle_prettify(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
                 toggle_prettify(id);
             }
         }
 
         #[unsafe(method(rvPasteJson:))]
-        fn rv_paste_json(&self, sender: &NSButton) {
-            if let Some(id) = window_id_from_button(sender) {
+        fn rv_paste_json(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
                 paste_from_clipboard(id);
             }
         }
 
         #[unsafe(method(rvClearDocument:))]
-        fn rv_clear_document(&self, sender: &NSButton) {
-            if let Some(id) = window_id_from_button(sender) {
+        fn rv_clear_document(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
                 clear_view(id);
             }
         }
 
         #[unsafe(method(rvCopyJq:))]
-        fn rv_copy_jq(&self, sender: &NSButton) {
-            if let Some(id) = window_id_from_button(sender) {
+        fn rv_copy_jq(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
                 copy_jq(id);
             }
         }
@@ -798,9 +798,19 @@ fn set_key(btn: &NSButton, key: &str, modifiers: NSEventModifierFlags) {
 
 // -- window-state helpers --------------------------------------------
 
-fn window_id_from_button(btn: &NSButton) -> Option<WindowId> {
-    let win = btn.window()?;
-    Some(window_id_of(&win))
+/// Get the window ID for an action sender. Works for NSButton (toolbar),
+/// NSMenuItem (menu bar), or any NSView subclass. Falls back to the
+/// application's key window.
+fn window_id_from_sender(sender: &AnyObject) -> Option<WindowId> {
+    // Try sender.window() — works for NSButton and any NSView.
+    let win: Option<Retained<NSWindow>> = unsafe { msg_send![sender, window] };
+    if let Some(w) = win {
+        return Some(window_id_of(&w));
+    }
+    // Fallback: key window (handles NSMenuItem which has no window).
+    let mtm = MainThreadMarker::new()?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.keyWindow().map(|w| window_id_of(&w))
 }
 
 /// Reuse any blank window (no document loaded); otherwise create a new
