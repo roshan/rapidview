@@ -421,6 +421,44 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     );
     edit_menu_item.setSubmenu(Some(&edit_menu));
 
+    // View menu: Prettify, Paste from Clipboard, Clear, Copy jq Path.
+    let view_menu_item = NSMenuItem::new(mtm);
+    menubar.addItem(&view_menu_item);
+    let view_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("View"));
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Prettify / Original",
+        objc2::sel!(rvTogglePrettify:),
+        "p",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Paste from Clipboard",
+        objc2::sel!(rvPasteJson:),
+        "v",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Clear Document",
+        objc2::sel!(rvClearDocument:),
+        "k",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Copy jq Path",
+        objc2::sel!(rvCopyJq:),
+        "c",
+        NSEventModifierFlags::Command,
+    );
+    view_menu_item.setSubmenu(Some(&view_menu));
+
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menubar));
 }
@@ -586,17 +624,17 @@ fn build_header_bar(
     let clipboard_button =
         make_icon_button(mtm, "doc.on.clipboard", "Paste from clipboard", target, objc2::sel!(rvPasteJson:));
     set_key(&clipboard_button, "v", cmd);
-    clipboard_button.setToolTip(Some(&NSString::from_str("Paste JSON from clipboard (⌘V)")));
+    clipboard_button.setToolTip(Some(&NSString::from_str("Paste JSON from clipboard  ⌘V")));
     let clear_button =
         make_icon_button(mtm, "xmark.circle", "Clear document", target, objc2::sel!(rvClearDocument:));
     set_key(&clear_button, "k", cmd);
-    clear_button.setToolTip(Some(&NSString::from_str("Clear document (⌘K)")));
-    let prettify_button = make_button(mtm, "Prettify", target, objc2::sel!(rvTogglePrettify:));
+    clear_button.setToolTip(Some(&NSString::from_str("Clear document  ⌘K")));
+    let prettify_button = make_button_underlined(mtm, "Prettify", 'P', target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
     prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
-    let copy_button = make_button(mtm, "Copy jq", target, objc2::sel!(rvCopyJq:));
+    let copy_button = make_button_underlined(mtm, "Copy jq", 'C', target, objc2::sel!(rvCopyJq:));
     set_key(&copy_button, "c", cmd);
-    copy_button.setToolTip(Some(&NSString::from_str("Copy jq path to clipboard (⌘C)")));
+    copy_button.setToolTip(Some(&NSString::from_str("Copy jq path (⌘C)")));
 
     let label = {
         let s = NSString::from_str(".");
@@ -687,6 +725,20 @@ fn make_button(
     btn
 }
 
+/// Create a button with one character underlined to hint at the keyboard
+/// shortcut. `underline_char` is matched case-insensitively in `title`.
+fn make_button_underlined(
+    mtm: MainThreadMarker,
+    title: &str,
+    underline_char: char,
+    target: &AnyObject,
+    action: objc2::runtime::Sel,
+) -> Retained<NSButton> {
+    let btn = make_button(mtm, title, target, action);
+    set_underlined_title(&btn, title, underline_char);
+    btn
+}
+
 fn make_icon_button(
     mtm: MainThreadMarker,
     symbol_name: &str,
@@ -709,6 +761,34 @@ fn make_icon_button(
     };
     btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Toolbar);
     btn
+}
+
+/// Set a button's title with one character underlined.
+fn set_underlined_title(btn: &NSButton, title: &str, underline_char: char) {
+    use objc2::AnyThread;
+    let ns_title = NSString::from_str(title);
+    let attr = objc2_foundation::NSMutableAttributedString::initWithString(
+        objc2_foundation::NSMutableAttributedString::alloc(),
+        &ns_title,
+    );
+    let uc_lower = underline_char.to_ascii_lowercase();
+    if let Some(pos) = title.char_indices().position(|(_, c)| c.to_ascii_lowercase() == uc_lower) {
+        let byte_pos = title.char_indices().nth(pos).unwrap().0;
+        let char_len = title[byte_pos..].chars().next().unwrap().len_utf16();
+        let utf16_pos: usize = title[..byte_pos].encode_utf16().count();
+        let range = objc2_foundation::NSRange {
+            location: utf16_pos,
+            length: char_len,
+        };
+        unsafe {
+            attr.addAttribute_value_range(
+                objc2_app_kit::NSUnderlineStyleAttributeName,
+                &*objc2_foundation::NSNumber::new_i64(1),
+                range,
+            );
+        }
+    }
+    btn.setAttributedTitle(&attr);
 }
 
 fn set_key(btn: &NSButton, key: &str, modifiers: NSEventModifierFlags) {
@@ -995,7 +1075,7 @@ fn toggle_prettify(id: WindowId) {
                 state.json_view.set_document(doc);
                 let saved = state.saved_original.clone();
                 restore_viewport(state, &saved);
-                state.prettify_button.setTitle(&NSString::from_str("Prettify"));
+                set_underlined_title(&state.prettify_button, "Prettify", 'P');
                 refresh_title(state);
             });
             rerun_search(id);
@@ -1007,7 +1087,7 @@ fn toggle_prettify(id: WindowId) {
                 state.json_view.set_document(doc);
                 let saved = state.saved_pretty.clone();
                 restore_viewport(state, &saved);
-                state.prettify_button.setTitle(&NSString::from_str("Original"));
+                set_underlined_title(&state.prettify_button, "Original", 'O');
                 refresh_title(state);
             });
             rerun_search(id);
@@ -1017,7 +1097,7 @@ fn toggle_prettify(id: WindowId) {
                 state.saved_original = save_viewport(state);
                 state.is_pretty = true;
                 state.pretty_pending = true;
-                state.prettify_button.setTitle(&NSString::from_str("Original"));
+                set_underlined_title(&state.prettify_button, "Original", 'O');
                 state
                     .window
                     .setTitle(&NSString::from_str("Rapid View — prettifying…"));
@@ -1141,7 +1221,7 @@ fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
             // drastically (single minified line → many short lines).
             let default_vp = app_state::SavedViewport::default();
             restore_viewport(state, &default_vp);
-            state.prettify_button.setTitle(&NSString::from_str("Original"));
+            set_underlined_title(&state.prettify_button, "Original", 'O');
         }
         refresh_title(state);
     });
