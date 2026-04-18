@@ -174,12 +174,19 @@ define_class!(
             let mtm = self.mtm();
             for url in urls.iter() {
                 if let Some(path) = url.path() {
-                    // Each incoming URL becomes a fresh tab unless we
-                    // still have a blank initial window we can reuse.
                     let target = find_or_create_tab_for_load(mtm, self);
                     load_file_into_window(target, &path.to_string());
                 }
             }
+        }
+
+        #[unsafe(method(application:openFile:))]
+        fn open_file(&self, _app: &NSApplication, filename: &NSString) -> bool {
+            let mtm = self.mtm();
+            let path = filename.to_string();
+            let target = find_or_create_tab_for_load(mtm, self);
+            load_file_into_window(target, &path);
+            true
         }
     }
 
