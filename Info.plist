@@ -33,6 +33,14 @@
         <dict>
             <key>CFBundleTypeName</key>
             <string>JSON Document</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>json</string>
+            </array>
+            <key>CFBundleTypeMIMETypes</key>
+            <array>
+                <string>application/json</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
