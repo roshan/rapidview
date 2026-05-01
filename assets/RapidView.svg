@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="blue" x1="206" y1="818" x2="820" y2="206" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b3f8f"/>
+      <stop offset="0.55" stop-color="#176fc2"/>
+      <stop offset="1" stop-color="#48a8ee"/>
+    </linearGradient>
+    <linearGradient id="arrowShade" x1="375" y1="702" x2="728" y2="349" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#083a88"/>
+      <stop offset="1" stop-color="#0e58aa"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="28" flood-color="#0f3360" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="226" fill="#f8fbff"/>
+  <rect x="56" y="56" width="912" height="912" rx="190" fill="none" stroke="#dce7f4" stroke-width="18"/>
+
+  <g filter="url(#shadow)">
+    <path
+      d="M394 226h96l-18 94h-42c-41 0-66 22-74 66l-19 104c-11 59-40 100-88 122 39 17 56 53 46 108l-19 104c-8 43 9 66 50 66h42l-18 94h-96c-91 0-131-52-112-155l18-96c10-56-10-84-61-84h-28l17-92h28c51 0 82-28 92-84l18-96c19-101 86-151 186-151z"
+      fill="url(#blue)"/>
+    <path
+      d="M630 226h96c100 0 168 50 186 151l18 96c10 56 41 84 92 84h28l17 92h-28c-51 0-71 28-61 84l18 96c19 103-21 155-112 155h-96l-18-94h42c41 0 58-23 50-66l-19-104c-10-55 7-91 46-108-48-22-77-63-88-122l-19-104c-8-44-33-66-74-66h-42l-18-94z"
+      fill="url(#blue)"/>
+    <path
+      d="M323 723 505 536 392 494l374-144-78 386-79-113-206 213c-29 30-73-25-80-113z"
+      fill="url(#arrowShade)"/>
+    <path
+      d="M392 494 766 350 505 536z"
+      fill="#3b9de6"/>
+  </g>
+</svg>

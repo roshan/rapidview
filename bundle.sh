@@ -21,6 +21,7 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 cp "$SRC_BIN" "$APP/Contents/MacOS/rapid-view"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/assets/RapidView.icns" "$APP/Contents/Resources/RapidView.icns"
 
 # Minimal PkgInfo — classic Mac bundle marker.
 printf 'APPL????' > "$APP/Contents/PkgInfo"

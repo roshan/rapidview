@@ -1,0 +1,21 @@
+[tasks.deploy]
+description = "Build, ad-hoc sign, and install Rapid View.app into /Applications"
+run = """
+set -euo pipefail
+
+app_name="Rapid View.app"
+src="target/release/${app_name}"
+dest="/Applications/${app_name}"
+
+./bundle.sh release
+
+codesign --force --deep --sign - "$src"
+
+if [ -d "$dest" ]; then
+  rm -rf "$dest" 2>/dev/null || sudo rm -rf "$dest"
+fi
+
+ditto "$src" "$dest" 2>/dev/null || sudo ditto "$src" "$dest"
+codesign --verify --deep --strict "$dest"
+echo "Installed $dest"
+"""

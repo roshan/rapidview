@@ -14,6 +14,8 @@
     <string>Rapid View</string>
     <key>CFBundleDisplayName</key>
     <string>Rapid View</string>
+    <key>CFBundleIconFile</key>
+    <string>RapidView</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
