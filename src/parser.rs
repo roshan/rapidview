@@ -871,32 +871,6 @@ mod tests {
     }
 
     #[test]
-    fn repro_user_crash_overmod_export() {
-        let path = "/Users/george/Downloads/overmod-export-2026-05-11.json";
-        let Ok(bytes) = std::fs::read(path) else {
-            eprintln!("skip: file not present");
-            return;
-        };
-        let out = parse(&bytes);
-        eprintln!("entries: {}, error: {:?}", out.paths.entries.len(), out.error);
-        let needle = b"ELpqNsanTYP9_wZXNjdF-FcEOcuu7jjeW9tgQyhCmss";
-        let pos = bytes
-            .windows(needle.len())
-            .position(|w| w == needle)
-            .expect("key in file");
-        let entry_idx = out.paths.lookup(pos as u32).unwrap();
-        let entry = out.paths.entries[entry_idx as usize];
-        eprintln!(
-            "entry: start={} end={} segment={:?}",
-            entry.start, entry.end, entry.segment
-        );
-        let value = value_bytes_for_entry(&bytes, &entry);
-        eprintln!("value len: {}", value.len());
-        let path_segs = out.paths.path_of(entry_idx);
-        eprintln!("jq path: {}", jq_path(&path_segs, &out.keys));
-    }
-
-    #[test]
     fn lenient_on_trailing_garbage() {
         let out = parse(b"{}  garbage");
         // Document parses successfully; we stop at the end of the value.
