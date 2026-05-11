@@ -453,6 +453,24 @@ impl JsonView {
         self.refresh_path_display();
     }
 
+    /// JSON sub-tree at the last-clicked offset. Falls back to the entire
+    /// document when there's no click (or no parseable entry containing
+    /// it). Returns None when no document is loaded.
+    pub fn current_json_subtree(&self) -> Option<String> {
+        let ivars = self.ivars();
+        let doc = ivars.doc.borrow().as_ref().cloned()?;
+        let bytes = doc.bytes.as_slice();
+        let offset = ivars.last_click_offset.get().unwrap_or(0);
+        let slice = match doc.output.paths.lookup(offset) {
+            Some(idx) => {
+                let entry = doc.output.paths.entries[idx as usize];
+                parser::value_bytes_for_entry(bytes, &entry)
+            }
+            None => bytes,
+        };
+        Some(String::from_utf8_lossy(slice).into_owned())
+    }
+
     /// jq expression for the last-clicked offset. `.` when nothing clicked.
     pub fn current_jq_expression(&self) -> String {
         let ivars = self.ivars();

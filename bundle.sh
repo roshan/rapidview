@@ -5,16 +5,19 @@ set -euo pipefail
 
 PROFILE="${1:-release}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$ROOT/target/$PROFILE/Rapid View.app"
+# Respect CARGO_TARGET_DIR so we read the binary cargo actually wrote.
+# Without this, a shell-level override (e.g. ~/.cargo points elsewhere) leaves
+# a stale binary in $ROOT/target/ that silently ships into the .app.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+APP="$TARGET_DIR/$PROFILE/Rapid View.app"
 BIN_NAME="rapid-view"
 
 if [ "$PROFILE" = "release" ]; then
     cargo build --release
-    SRC_BIN="$ROOT/target/release/$BIN_NAME"
 else
     cargo build
-    SRC_BIN="$ROOT/target/debug/$BIN_NAME"
 fi
+SRC_BIN="$TARGET_DIR/$PROFILE/$BIN_NAME"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"

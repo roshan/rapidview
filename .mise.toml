@@ -4,7 +4,8 @@ run = """
 set -euo pipefail
 
 app_name="Rapid View.app"
-src="target/release/${app_name}"
+target_dir="${CARGO_TARGET_DIR:-target}"
+src="${target_dir}/release/${app_name}"
 dest="/Applications/${app_name}"
 
 ./bundle.sh release

@@ -245,6 +245,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(rvCopyJson:))]
+        fn rv_copy_json(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                copy_json(id);
+            }
+        }
+
         #[unsafe(method(rvWorkerTick:))]
         fn rv_worker_tick(&self, _timer: &NSTimer) {
             drain_worker();
@@ -457,6 +464,14 @@ fn install_menu_bar(mtm: MainThreadMarker) {
         "c",
         NSEventModifierFlags::Command,
     );
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Copy JSON Sub-tree",
+        objc2::sel!(rvCopyJson:),
+        "c",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+    );
     view_menu_item.setSubmenu(Some(&view_menu));
 
     let app = NSApplication::sharedApplication(mtm);
@@ -632,6 +647,11 @@ fn build_header_bar(
     let prettify_button = make_button_underlined(mtm, "Prettify", 'P', target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
     prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
+    let copy_json_button = make_button(mtm, "Copy JSON", target, objc2::sel!(rvCopyJson:));
+    set_key(&copy_json_button, "c", cmd.union(NSEventModifierFlags::Shift));
+    copy_json_button.setToolTip(Some(&NSString::from_str(
+        "Copy JSON sub-tree at cursor — or entire document if nothing selected (⇧⌘C)",
+    )));
     let copy_button = make_button_underlined(mtm, "Copy jq", 'C', target, objc2::sel!(rvCopyJq:));
     set_key(&copy_button, "c", cmd);
     copy_button.setToolTip(Some(&NSString::from_str("Copy jq path (⌘C)")));
@@ -651,6 +671,7 @@ fn build_header_bar(
         &*clear_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
+        &*copy_json_button as &NSView,
         &*copy_button as &NSView,
     ]);
     let header = NSStackView::stackViewWithViews(&header_views, mtm);
@@ -801,11 +822,19 @@ fn set_key(btn: &NSButton, key: &str, modifiers: NSEventModifierFlags) {
 /// Get the window ID for an action sender. Works for NSButton (toolbar),
 /// NSMenuItem (menu bar), or any NSView subclass. Falls back to the
 /// application's key window.
+///
+/// `msg_send![sender, window]` on an NSMenuItem raises
+/// `doesNotRecognizeSelector:` — an Objective-C exception that becomes a
+/// nounwind panic in Rust. So we gate the call on `respondsToSelector:`.
 fn window_id_from_sender(sender: &AnyObject) -> Option<WindowId> {
-    // Try sender.window() — works for NSButton and any NSView.
-    let win: Option<Retained<NSWindow>> = unsafe { msg_send![sender, window] };
-    if let Some(w) = win {
-        return Some(window_id_of(&w));
+    let sel_window = objc2::sel!(window);
+    let responds: objc2::runtime::Bool =
+        unsafe { msg_send![sender, respondsToSelector: sel_window] };
+    if responds.as_bool() {
+        let win: Option<Retained<NSWindow>> = unsafe { msg_send![sender, window] };
+        if let Some(w) = win {
+            return Some(window_id_of(&w));
+        }
     }
     // Fallback: key window (handles NSMenuItem which has no window).
     let mtm = MainThreadMarker::new()?;
@@ -916,6 +945,25 @@ fn copy_jq(id: WindowId) {
         pb.setString_forType(&ns, type_str);
     }
     eprintln!("copied jq: {}", expr);
+}
+
+/// Copy the JSON sub-tree at the cursor — or the entire document if
+/// nothing has been clicked yet — to the clipboard.
+fn copy_json(id: WindowId) {
+    let Some(text) = with_window(id, |s| s.json_view.current_json_subtree()).flatten() else {
+        eprintln!("rapid-view: nothing to copy (no document loaded)");
+        return;
+    };
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    let ns = NSString::from_str(&text);
+    unsafe {
+        let type_str: &NSString = NSPasteboardTypeString;
+        let types = NSArray::from_slice(&[type_str]);
+        pb.declareTypes_owner(&types, None);
+        pb.setString_forType(&ns, type_str);
+    }
+    eprintln!("copied JSON sub-tree ({} bytes)", text.len());
 }
 
 /// Capture the current scroll position + cursor offset from the view.
@@ -1261,6 +1309,28 @@ fn with_app_delegate<R>(f: impl FnOnce(&AnyObject) -> R) -> R {
 }
 
 fn main() {
+    // Apps launched from Finder have stderr connected to /dev/null, so Rust
+    // panic messages are lost. Write panics to a fixed log file so we can
+    // diagnose user-side crashes that don't reproduce locally.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rapid-view-panic.log")
+            .and_then(|mut f| {
+                writeln!(
+                    f,
+                    "[{}] panic: {}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    info
+                )
+            });
+    }));
+
     if std::env::args().any(|a| a == "--selftest-launch") {
         app_state::SELFTEST_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
     }

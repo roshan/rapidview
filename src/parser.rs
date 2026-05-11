@@ -634,6 +634,57 @@ pub fn jq_path(segments: &[PathSegment], keys: &KeyInterner) -> String {
     out
 }
 
+/// Bytes of the JSON *value* covered by `entry`. For object fields the
+/// entry's raw range covers `"key": value`; this skips the key + colon so
+/// the result is a standalone JSON value. For array elements and the root
+/// the raw range is already a value, modulo leading/trailing whitespace.
+pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8] {
+    let start = (entry.start as usize).min(bytes.len());
+    let end = (entry.end as usize).min(bytes.len());
+    if end <= start {
+        return &[];
+    }
+    let slice = &bytes[start..end];
+    match entry.segment {
+        PathSegment::Root => slice.trim_ascii(),
+        PathSegment::Index(_) => slice,
+        PathSegment::Key(_) => skip_key_and_colon(slice),
+    }
+}
+
+/// Walk past `"key" : ` at the start of `slice` and return the rest.
+/// Defensive: if the shape doesn't match (malformed input), returns the
+/// slice unchanged so the user sees something rather than nothing.
+fn skip_key_and_colon(slice: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < slice.len() && matches!(slice[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    if i >= slice.len() || slice[i] != b'"' {
+        return slice;
+    }
+    i += 1;
+    while i < slice.len() {
+        let c = slice[i];
+        i += 1;
+        if c == b'\\' && i < slice.len() {
+            i += 1;
+        } else if c == b'"' {
+            break;
+        }
+    }
+    while i < slice.len() && matches!(slice[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    if i < slice.len() && slice[i] == b':' {
+        i += 1;
+    }
+    while i < slice.len() && matches!(slice[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    &slice[i..]
+}
+
 fn is_identifier(s: &str) -> bool {
     let mut it = s.chars();
     match it.next() {
@@ -773,6 +824,76 @@ mod tests {
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
         assert_eq!(jq_path(&path, &out.keys), ".a");
+    }
+
+    fn value_bytes_at(src: &[u8], offset: Offset) -> &[u8] {
+        let out = parse(src);
+        let entry_idx = out.paths.lookup(offset).expect("offset has a path entry");
+        let entry = out.paths.entries[entry_idx as usize];
+        value_bytes_for_entry(src, &entry)
+    }
+
+    #[test]
+    fn value_bytes_for_root_is_whole_doc_trimmed() {
+        let src = b"  { \"a\": 1 }  ";
+        // Clicking on leading whitespace gives root.
+        assert_eq!(value_bytes_at(src, 0), b"{ \"a\": 1 }");
+    }
+
+    #[test]
+    fn value_bytes_for_object_field_skips_key() {
+        let src = br#"{"a":{"b":[1,2,3]}}"#;
+        let pos = offset_of(src, b'b'); // click on key "b"
+        // Should give the value of "b", which is the array.
+        assert_eq!(value_bytes_at(src, pos), b"[1,2,3]");
+    }
+
+    #[test]
+    fn value_bytes_for_array_element() {
+        let src = b"[10,20,30]";
+        let pos = offset_of(src, b'2'); // hits the "2" in 20
+        assert_eq!(value_bytes_at(src, pos), b"20");
+    }
+
+    #[test]
+    fn value_bytes_for_nested_object_value() {
+        let src = br#"{"a": {"b": 1}, "c": 2}"#;
+        // Click on the "a" key — the value is the nested object.
+        let pos = offset_of(src, b'a');
+        assert_eq!(value_bytes_at(src, pos), b"{\"b\": 1}");
+    }
+
+    #[test]
+    fn value_bytes_for_pretty_field_keeps_value() {
+        let src = b"{\n  \"a\": 42\n}";
+        let pos = offset_of(src, b'a');
+        assert_eq!(value_bytes_at(src, pos), b"42");
+    }
+
+    #[test]
+    fn repro_user_crash_overmod_export() {
+        let path = "/Users/george/Downloads/overmod-export-2026-05-11.json";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: file not present");
+            return;
+        };
+        let out = parse(&bytes);
+        eprintln!("entries: {}, error: {:?}", out.paths.entries.len(), out.error);
+        let needle = b"ELpqNsanTYP9_wZXNjdF-FcEOcuu7jjeW9tgQyhCmss";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("key in file");
+        let entry_idx = out.paths.lookup(pos as u32).unwrap();
+        let entry = out.paths.entries[entry_idx as usize];
+        eprintln!(
+            "entry: start={} end={} segment={:?}",
+            entry.start, entry.end, entry.segment
+        );
+        let value = value_bytes_for_entry(&bytes, &entry);
+        eprintln!("value len: {}", value.len());
+        let path_segs = out.paths.path_of(entry_idx);
+        eprintln!("jq path: {}", jq_path(&path_segs, &out.keys));
     }
 
     #[test]
