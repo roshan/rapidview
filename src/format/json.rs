@@ -1,168 +1,20 @@
-//! Hand-rolled streaming JSON tokenizer.
+//! Hand-rolled streaming JSON tokenizer + prettifier.
 //!
-//! Walks `&[u8]` once and produces the three indexes the UI needs:
+//! Walks `&[u8]` once and produces the three indexes the renderer needs:
 //!
 //! * `line_starts` — byte offsets of each line start, for `drawRect:` to
 //!   map pixel Y back to a byte range.
-//! * `PathIndex`   — sorted list of nested value ranges tagged with a path
-//!   segment, for click → JSON path lookup.
+//! * `PathIndex`   — sorted list of nested value ranges tagged with a
+//!   path segment, for click → JSON path lookup.
 //! * `styles`      — non-overlapping style ranges for syntax colouring.
 //!
-//! Lenient: on parse error the partial indexes are still returned, so the
-//! viewer can display broken files up to the point they go wrong.
+//! Lenient: on parse error the partial indexes are still returned, so
+//! the viewer can display broken files up to the point they go wrong.
 
-
-use std::collections::HashMap;
-
-pub type Offset = u32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StyleKind {
-    Key,
-    String,
-    Number,
-    Bool,
-    Null,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct StyleSpan {
-    pub start: Offset,
-    pub end: Offset,
-    pub kind: StyleKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathSegment {
-    Root,
-    Key(u32),
-    Index(u32),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PathEntry {
-    pub start: Offset,
-    pub end: Offset,
-    pub parent: u32,
-    pub segment: PathSegment,
-}
-
-pub const ROOT_PARENT: u32 = u32::MAX;
-
-#[derive(Debug, Default)]
-pub struct KeyInterner {
-    map: HashMap<Box<[u8]>, u32>,
-    buf: Vec<u8>,
-    ranges: Vec<(u32, u32)>,
-}
-
-impl KeyInterner {
-    pub fn intern(&mut self, key: &[u8]) -> u32 {
-        if let Some(&id) = self.map.get(key) {
-            return id;
-        }
-        let start = self.buf.len() as u32;
-        self.buf.extend_from_slice(key);
-        let len = key.len() as u32;
-        let id = self.ranges.len() as u32;
-        self.ranges.push((start, len));
-        self.map.insert(key.to_vec().into_boxed_slice(), id);
-        id
-    }
-
-    pub fn get(&self, id: u32) -> &[u8] {
-        let (start, len) = self.ranges[id as usize];
-        &self.buf[start as usize..(start + len) as usize]
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.ranges.len()
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PathIndex {
-    pub entries: Vec<PathEntry>,
-}
-
-impl PathIndex {
-    /// Innermost entry whose range contains `offset`. Walks up via `parent`
-    /// if the nearest-by-start sibling has already ended — proper nesting
-    /// guarantees the parent then contains it, so this is O(depth).
-    pub fn lookup(&self, offset: Offset) -> Option<u32> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let mut lo = 0usize;
-        let mut hi = self.entries.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.entries[mid].start <= offset {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return None;
-        }
-        let mut i = (lo - 1) as u32;
-        loop {
-            let e = self.entries[i as usize];
-            if e.end > offset {
-                return Some(i);
-            }
-            if e.parent == ROOT_PARENT {
-                return Some(i);
-            }
-            i = e.parent;
-        }
-    }
-
-    /// Segments from root (exclusive) to `entry` (inclusive).
-    pub fn path_of(&self, entry: u32) -> Vec<PathSegment> {
-        let mut out = Vec::new();
-        let mut i = entry;
-        while i != ROOT_PARENT {
-            let e = self.entries[i as usize];
-            if !matches!(e.segment, PathSegment::Root) {
-                out.push(e.segment);
-            }
-            i = e.parent;
-        }
-        out.reverse();
-        out
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ParseOutput {
-    pub line_starts: Vec<Offset>,
-    pub paths: PathIndex,
-    pub styles: Vec<StyleSpan>,
-    pub keys: KeyInterner,
-    #[allow(dead_code)] // inspected in tests and by callers
-    pub error: Option<ParseError>,
-    #[allow(dead_code)]
-    pub bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read via Debug formatting in error paths
-pub struct ParseError {
-    pub offset: Offset,
-    pub kind: ParseErrorKind,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // variants constructed by parser, read via Debug
-pub enum ParseErrorKind {
-    UnexpectedByte(u8),
-    UnexpectedEof,
-    InvalidEscape,
-    InvalidNumber,
-}
+use super::{
+    NameInterner, Offset, ParseError, ParseErrorKind, ParseOutput, PathEntry, PathIndex,
+    PathSegment, ROOT_PARENT, StyleKind, StyleSpan,
+};
 
 struct Parser<'a> {
     input: &'a [u8],
@@ -170,7 +22,7 @@ struct Parser<'a> {
     line_starts: Vec<Offset>,
     paths: Vec<PathEntry>,
     styles: Vec<StyleSpan>,
-    keys: KeyInterner,
+    names: NameInterner,
     scratch: Vec<u8>,
 }
 
@@ -182,7 +34,7 @@ impl<'a> Parser<'a> {
             line_starts: vec![0],
             paths: Vec::new(),
             styles: Vec::new(),
-            keys: KeyInterner::default(),
+            names: NameInterner::default(),
             scratch: Vec::with_capacity(64),
         }
     }
@@ -277,7 +129,7 @@ impl<'a> Parser<'a> {
 
             // Decode escapes into scratch, then intern.
             decode_escapes_into(self.input, content_range, &mut self.scratch)?;
-            let key_id = self.keys.intern(&self.scratch);
+            let key_id = self.names.intern(&self.scratch);
 
             let field_idx = self.paths.len() as u32;
             self.paths.push(PathEntry {
@@ -360,8 +212,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Consume opening `"` through matching `"`. Returns the byte range of
-    /// the raw (still-escaped) contents, exclusive of quotes.
+    /// Consume opening `"` through matching `"`. Returns the byte range
+    /// of the raw (still-escaped) contents, exclusive of quotes.
     fn parse_string_raw(&mut self) -> Result<(u32, u32), ParseError> {
         debug_assert_eq!(self.peek(), Some(b'"'));
         self.advance();
@@ -476,7 +328,7 @@ impl<'a> Parser<'a> {
                 entries: self.paths,
             },
             styles: self.styles,
-            keys: self.keys,
+            names: self.names,
             error,
             bytes: self.input.len(),
         }
@@ -530,7 +382,6 @@ fn decode_escapes_into(
                 })?;
                 i += 4;
                 let cp = if (0xD800..=0xDBFF).contains(&n) {
-                    // High surrogate — look for paired low surrogate.
                     if i + 6 <= src.len() && src[i] == b'\\' && src[i + 1] == b'u' {
                         if let Some(n2) = parse_hex4(&src[i + 2..i + 6]) {
                             if (0xDC00..=0xDFFF).contains(&n2) {
@@ -585,9 +436,9 @@ pub fn parse(input: &[u8]) -> ParseOutput {
     p.finish(err)
 }
 
-/// Render a path as a jq expression. Non-identifier keys are emitted as
-/// `["..."]`; array indices as `[N]`. Empty path → ".".
-pub fn jq_path(segments: &[PathSegment], keys: &KeyInterner) -> String {
+/// Render a JSON path as a jq expression. Non-identifier keys are
+/// emitted as `["..."]`; array indices as `[N]`. Empty path → ".".
+pub fn path_expression(segments: &[PathSegment], names: &NameInterner) -> String {
     if segments.is_empty() {
         return ".".to_string();
     }
@@ -596,7 +447,7 @@ pub fn jq_path(segments: &[PathSegment], keys: &KeyInterner) -> String {
         match seg {
             PathSegment::Root => {}
             PathSegment::Key(id) => {
-                let bytes = keys.get(*id);
+                let bytes = names.get(*id);
                 let s = std::str::from_utf8(bytes).unwrap_or("\u{FFFD}");
                 if is_identifier(s) {
                     out.push('.');
@@ -621,10 +472,12 @@ pub fn jq_path(segments: &[PathSegment], keys: &KeyInterner) -> String {
                 use std::fmt::Write;
                 let _ = write!(out, "[{}]", i);
             }
+            // XML segments shouldn't appear in a JSON doc — be safe.
+            PathSegment::Element { .. } | PathSegment::Attribute(_) => {}
         }
     }
-    // When the first segment is an index, `out` starts with `[` — jq wants
-    // `.[0]`, so prepend a dot in that case.
+    // When the first segment is an index, `out` starts with `[` — jq
+    // wants `.[0]`, so prepend a dot in that case.
     if out.starts_with('[') {
         let mut tmp = String::with_capacity(out.len() + 1);
         tmp.push('.');
@@ -635,9 +488,10 @@ pub fn jq_path(segments: &[PathSegment], keys: &KeyInterner) -> String {
 }
 
 /// Bytes of the JSON *value* covered by `entry`. For object fields the
-/// entry's raw range covers `"key": value`; this skips the key + colon so
-/// the result is a standalone JSON value. For array elements and the root
-/// the raw range is already a value, modulo leading/trailing whitespace.
+/// entry's raw range covers `"key": value`; this skips the key + colon
+/// so the result is a standalone JSON value. For array elements and
+/// the root the raw range is already a value, modulo leading/trailing
+/// whitespace.
 pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8] {
     let start = (entry.start as usize).min(bytes.len());
     let end = (entry.end as usize).min(bytes.len());
@@ -649,12 +503,10 @@ pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8]
         PathSegment::Root => slice.trim_ascii(),
         PathSegment::Index(_) => slice,
         PathSegment::Key(_) => skip_key_and_colon(slice),
+        PathSegment::Element { .. } | PathSegment::Attribute(_) => slice,
     }
 }
 
-/// Walk past `"key" : ` at the start of `slice` and return the rest.
-/// Defensive: if the shape doesn't match (malformed input), returns the
-/// slice unchanged so the user sees something rather than nothing.
 fn skip_key_and_colon(slice: &[u8]) -> &[u8] {
     let mut i = 0;
     while i < slice.len() && matches!(slice[i], b' ' | b'\t' | b'\n' | b'\r') {
@@ -692,6 +544,110 @@ fn is_identifier(s: &str) -> bool {
         _ => return false,
     }
     it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+// --- prettifier -----------------------------------------------------
+
+const INDENT: &[u8] = b"  ";
+
+/// Byte-level state machine: tokenises the input just enough to
+/// recognise structural punctuation and string boundaries, and re-emits
+/// with 2-space indentation and a newline after each comma.
+pub fn prettify(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 4);
+    let mut depth: usize = 0;
+    let mut i: usize = 0;
+    let n = input.len();
+
+    while i < n {
+        let b = input[i];
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                i += 1;
+            }
+            b'{' | b'[' => {
+                out.push(b);
+                i += 1;
+                let mut j = i;
+                while j < n && matches!(input[j], b' ' | b'\t' | b'\n' | b'\r') {
+                    j += 1;
+                }
+                let close = if b == b'{' { b'}' } else { b']' };
+                if j < n && input[j] == close {
+                    out.push(close);
+                    i = j + 1;
+                } else {
+                    depth += 1;
+                    write_indent(&mut out, depth);
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                write_indent(&mut out, depth);
+                out.push(b);
+                i += 1;
+            }
+            b',' => {
+                out.push(b',');
+                write_indent(&mut out, depth);
+                i += 1;
+            }
+            b':' => {
+                out.push(b':');
+                out.push(b' ');
+                i += 1;
+            }
+            b'"' => {
+                copy_string(input, &mut i, &mut out);
+            }
+            _ => {
+                while i < n {
+                    let c = input[i];
+                    if matches!(
+                        c,
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b','
+                            | b'}'
+                            | b']'
+                            | b':'
+                            | b'"'
+                            | b'{'
+                            | b'['
+                    ) {
+                        break;
+                    }
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn write_indent(out: &mut Vec<u8>, depth: usize) {
+    out.push(b'\n');
+    for _ in 0..depth {
+        out.extend_from_slice(INDENT);
+    }
+}
+
+fn copy_string(input: &[u8], pos: &mut usize, out: &mut Vec<u8>) {
+    out.push(input[*pos]);
+    *pos += 1;
+    while *pos < input.len() {
+        let c = input[*pos];
+        out.push(c);
+        *pos += 1;
+        if c == b'\\' && *pos < input.len() {
+            out.push(input[*pos]);
+            *pos += 1;
+        } else if c == b'"' {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -735,7 +691,7 @@ mod tests {
         assert_eq!(path.len(), 3);
         assert!(matches!(path[2], PathSegment::Index(1)));
 
-        let jq = jq_path(&path, &out.keys);
+        let jq = path_expression(&path, &out.names);
         assert_eq!(jq, ".a.b[1]");
     }
 
@@ -747,28 +703,27 @@ mod tests {
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
-        assert_eq!(jq_path(&path, &out.keys), r#".["has space"]"#);
+        assert_eq!(path_expression(&path, &out.names), r#".["has space"]"#);
     }
 
     #[test]
     fn leading_index_prepends_dot() {
         let src = b"[10,20,30]";
         let out = parse(src);
-        let pos = offset_of(src, b'2'); // hits the '2' in 20
+        let pos = offset_of(src, b'2');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
-        assert_eq!(jq_path(&path, &out.keys), ".[1]");
+        assert_eq!(path_expression(&path, &out.names), ".[1]");
     }
 
     #[test]
     fn root_lookup_empty_path() {
         let src = b"   {   }   ";
         let out = parse(src);
-        // Click on the leading whitespace (offset 0)
         let entry = out.paths.lookup(0).unwrap();
         let path = out.paths.path_of(entry);
         assert!(path.is_empty());
-        assert_eq!(jq_path(&path, &out.keys), ".");
+        assert_eq!(path_expression(&path, &out.names), ".");
     }
 
     #[test]
@@ -780,26 +735,26 @@ mod tests {
 
     #[test]
     fn unicode_escape_in_key() {
-        // {"\u00e9":1}  → key "é"
+        // {"é":1}  → key "é"
         let src = br#"{"\u00e9":1}"#;
         let out = parse(src);
         assert!(out.error.is_none(), "error: {:?}", out.error);
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
-        assert_eq!(jq_path(&path, &out.keys), r#".["é"]"#);
+        assert_eq!(path_expression(&path, &out.names), r#".["é"]"#);
     }
 
     #[test]
     fn surrogate_pair_in_key() {
-        // U+1F600 GRINNING FACE = \uD83D\uDE00
+        // U+1F600 GRINNING FACE = 😀
         let src = br#"{"\uD83D\uDE00":1}"#;
         let out = parse(src);
         assert!(out.error.is_none(), "error: {:?}", out.error);
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
-        assert_eq!(jq_path(&path, &out.keys), r#".["😀"]"#);
+        assert_eq!(path_expression(&path, &out.names), r#".["😀"]"#);
     }
 
     #[test]
@@ -817,13 +772,12 @@ mod tests {
 
     #[test]
     fn lookup_inside_key_returns_field_path() {
-        // Clicking on the `a` character of the key should give [.a].
         let src = br#"{"a":1}"#;
         let out = parse(src);
         let pos = offset_of(src, b'a');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
-        assert_eq!(jq_path(&path, &out.keys), ".a");
+        assert_eq!(path_expression(&path, &out.names), ".a");
     }
 
     fn value_bytes_at(src: &[u8], offset: Offset) -> &[u8] {
@@ -836,29 +790,26 @@ mod tests {
     #[test]
     fn value_bytes_for_root_is_whole_doc_trimmed() {
         let src = b"  { \"a\": 1 }  ";
-        // Clicking on leading whitespace gives root.
         assert_eq!(value_bytes_at(src, 0), b"{ \"a\": 1 }");
     }
 
     #[test]
     fn value_bytes_for_object_field_skips_key() {
         let src = br#"{"a":{"b":[1,2,3]}}"#;
-        let pos = offset_of(src, b'b'); // click on key "b"
-        // Should give the value of "b", which is the array.
+        let pos = offset_of(src, b'b');
         assert_eq!(value_bytes_at(src, pos), b"[1,2,3]");
     }
 
     #[test]
     fn value_bytes_for_array_element() {
         let src = b"[10,20,30]";
-        let pos = offset_of(src, b'2'); // hits the "2" in 20
+        let pos = offset_of(src, b'2');
         assert_eq!(value_bytes_at(src, pos), b"20");
     }
 
     #[test]
     fn value_bytes_for_nested_object_value() {
         let src = br#"{"a": {"b": 1}, "c": 2}"#;
-        // Click on the "a" key — the value is the nested object.
         let pos = offset_of(src, b'a');
         assert_eq!(value_bytes_at(src, pos), b"{\"b\": 1}");
     }
@@ -873,14 +824,82 @@ mod tests {
     #[test]
     fn lenient_on_trailing_garbage() {
         let out = parse(b"{}  garbage");
-        // Document parses successfully; we stop at the end of the value.
         assert!(out.error.is_none());
     }
 
+    // --- prettifier ---
+
+    fn run_pretty(src: &[u8]) -> String {
+        String::from_utf8(prettify(src)).unwrap()
+    }
+
     #[test]
-    #[ignore] // run with `cargo test --release -- --ignored bench_parse_synthetic --nocapture`
+    fn pretty_empty_containers_stay_inline() {
+        assert_eq!(run_pretty(b"{}"), "{}");
+        assert_eq!(run_pretty(b"[]"), "[]");
+        assert_eq!(run_pretty(b"{  }"), "{}");
+        assert_eq!(run_pretty(b"[ \n ]"), "[]");
+    }
+
+    #[test]
+    fn pretty_object_with_one_field() {
+        assert_eq!(run_pretty(br#"{"a":1}"#), "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn pretty_nested_object() {
+        let got = run_pretty(br#"{"a":{"b":1}}"#);
+        assert_eq!(got, "{\n  \"a\": {\n    \"b\": 1\n  }\n}");
+    }
+
+    #[test]
+    fn pretty_array_with_items() {
+        let got = run_pretty(b"[1,2,3]");
+        assert_eq!(got, "[\n  1,\n  2,\n  3\n]");
+    }
+
+    #[test]
+    fn pretty_mixed_nesting() {
+        let got = run_pretty(br#"{"a":1,"b":[1,2,{"c":3}]}"#);
+        let expected =
+            "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2,\n    {\n      \"c\": 3\n    }\n  ]\n}";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pretty_strings_are_copied_verbatim_including_escapes() {
+        let got = run_pretty(br#"{"k":"hello\"world\\x"}"#);
+        assert_eq!(got, "{\n  \"k\": \"hello\\\"world\\\\x\"\n}");
+    }
+
+    #[test]
+    fn pretty_input_whitespace_is_collapsed() {
+        let got = run_pretty(b"{\n  \"a\"  :   1  }");
+        assert_eq!(got, "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn pretty_already_pretty_stays_pretty() {
+        let input = "{\n  \"a\": 1,\n  \"b\": 2\n}";
+        let got = run_pretty(input.as_bytes());
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn pretty_literals_and_numbers() {
+        let got = run_pretty(b"[true,false,null,-1.5e10]");
+        assert_eq!(got, "[\n  true,\n  false,\n  null,\n  -1.5e10\n]");
+    }
+
+    #[test]
+    fn pretty_empty_nested() {
+        let got = run_pretty(br#"{"a":{},"b":[]}"#);
+        assert_eq!(got, "{\n  \"a\": {},\n  \"b\": []\n}");
+    }
+
+    #[test]
+    #[ignore]
     fn bench_parse_synthetic() {
-        // Generate ~100 MB of JSON: array of 500k objects.
         let mut src = String::with_capacity(128 * 1024 * 1024);
         src.push('[');
         for i in 0..500_000 {

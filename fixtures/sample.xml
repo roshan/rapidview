@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<library name="Central">
+  <book id="1" lang="en">
+    <title>The Pragmatic Programmer</title>
+    <author>Andy Hunt</author>
+    <author>Dave Thomas</author>
+    <year>1999</year>
+  </book>
+  <book id="2" lang="en">
+    <title>Structure and Interpretation of Computer Programs</title>
+    <author>Harold Abelson</author>
+    <author>Gerald Jay Sussman</author>
+    <year>1985</year>
+  </book>
+  <!-- A note in the middle to test comment handling -->
+  <magazine title="2600" />
+  <quote>Talk is cheap. <em>Show me the code.</em> — Linus</quote>
+</library>

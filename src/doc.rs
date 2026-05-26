@@ -1,13 +1,14 @@
-//! Document model — owns the byte buffer and the parse indexes.
+//! Document model — owns the byte buffer, the chosen format, and the
+//! parse indexes.
 //!
-//! Backing storage is a `ByteSource` so an open document can be either an
-//! `mmap`'d file (zero-copy, great for huge inputs) or an owned byte
-//! buffer (used for pretty-printed output which has no on-disk source).
-//! `ByteSource` is cheaply cloneable — both variants are `Arc`-wrapped —
-//! so the worker thread and the main thread can share the same bytes.
+//! Backing storage is a `ByteSource` so an open document can be either
+//! an `mmap`'d file (zero-copy, great for huge inputs) or an owned
+//! byte buffer (used for pretty-printed output which has no on-disk
+//! source). `ByteSource` is cheaply cloneable — both variants are
+//! `Arc`-wrapped — so the worker thread and the main thread can share
+//! the same bytes.
 
-
-use crate::parser::{self, ParseOutput};
+use crate::format::{self, Format, ParseOutput};
 use memmap2::Mmap;
 use std::sync::Arc;
 
@@ -36,6 +37,7 @@ impl ByteSource {
 
 pub struct Document {
     pub bytes: ByteSource,
+    pub format: Format,
     pub output: ParseOutput,
     /// Longest line in bytes — used to size the document view width so
     /// long lines don't trigger per-frame layout scans.
@@ -43,11 +45,12 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn from_source(bytes: ByteSource) -> Arc<Self> {
-        let output = parser::parse(bytes.as_slice());
+    pub fn from_source(format: Format, bytes: ByteSource) -> Arc<Self> {
+        let output = format::parse(format, bytes.as_slice());
         let max_line_bytes = max_line_length(&output.line_starts, bytes.len() as u32);
         Arc::new(Self {
             bytes,
+            format,
             output,
             max_line_bytes,
         })

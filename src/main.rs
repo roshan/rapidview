@@ -1,4 +1,4 @@
-//! Rapid View — native macOS JSON viewer.
+//! Rapid View — native macOS JSON / XML viewer.
 //!
 //! Multi-window: each tab is a separate `NSWindow` sharing a common
 //! `tabbingIdentifier` so AppKit merges them automatically. Per-tab
@@ -12,12 +12,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod doc;
-mod json_view;
-mod parser;
-mod pretty;
+mod doc_view;
+mod format;
 mod worker;
 
-use json_view::JsonView;
+use doc_view::DocView;
+use format::Format;
 use objc2_app_kit::{NSControlTextEditingDelegate, NSTextFieldDelegate};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -42,7 +42,7 @@ mod app_state {
     //! Process-wide state. Single-threaded access from the main thread only;
     //! the worker thread talks back via mpsc, so we don't need a Mutex here.
     use crate::doc::Document;
-    use crate::json_view::JsonView;
+    use crate::doc_view::DocView;
     use crate::worker::{WindowId, WorkerChannel};
     use objc2::rc::Retained;
     use objc2_app_kit::{NSButton, NSStackView, NSTextField, NSWindow};
@@ -64,8 +64,12 @@ mod app_state {
 
     pub struct WindowState {
         pub window: Retained<NSWindow>,
-        pub json_view: Retained<JsonView>,
+        pub doc_view: Retained<DocView>,
         pub prettify_button: Retained<NSButton>,
+        /// "Copy jq" / "Copy XPath" — title updates when a doc loads.
+        pub copy_path_button: Retained<NSButton>,
+        /// "Copy JSON" / "Copy XML" — title updates when a doc loads.
+        pub copy_subtree_button: Retained<NSButton>,
         /// Kept alive so the view's weak reference to the breadcrumb
         /// label stays valid for the window's lifetime.
         #[allow(dead_code)]
@@ -92,8 +96,8 @@ mod app_state {
             self.pretty_pending = false;
             self.saved_original = SavedViewport::default();
             self.saved_pretty = SavedViewport::default();
-            self.json_view.set_last_click_offset(None);
-            self.json_view.clear_search();
+            self.doc_view.set_last_click_offset(None);
+            self.doc_view.clear_search();
             self.prettify_button
                 .setTitle(&objc2_foundation::NSString::from_str("Prettify"));
         }
@@ -224,8 +228,8 @@ define_class!(
             }
         }
 
-        #[unsafe(method(rvPasteJson:))]
-        fn rv_paste_json(&self, sender: &AnyObject) {
+        #[unsafe(method(rvPaste:))]
+        fn rv_paste(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
                 paste_from_clipboard(id);
             }
@@ -238,17 +242,17 @@ define_class!(
             }
         }
 
-        #[unsafe(method(rvCopyJq:))]
-        fn rv_copy_jq(&self, sender: &AnyObject) {
+        #[unsafe(method(rvCopyPath:))]
+        fn rv_copy_path(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
-                copy_jq(id);
+                copy_path_expression(id);
             }
         }
 
-        #[unsafe(method(rvCopyJson:))]
-        fn rv_copy_json(&self, sender: &AnyObject) {
+        #[unsafe(method(rvCopySubtree:))]
+        fn rv_copy_subtree(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
-                copy_json(id);
+                copy_subtree(id);
             }
         }
 
@@ -428,7 +432,7 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     );
     edit_menu_item.setSubmenu(Some(&edit_menu));
 
-    // View menu: Prettify, Paste from Clipboard, Clear, Copy jq Path.
+    // View menu: Prettify, Paste from Clipboard, Clear, Copy Path.
     let view_menu_item = NSMenuItem::new(mtm);
     menubar.addItem(&view_menu_item);
     let view_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("View"));
@@ -444,7 +448,7 @@ fn install_menu_bar(mtm: MainThreadMarker) {
         mtm,
         &view_menu,
         "Paste from Clipboard",
-        objc2::sel!(rvPasteJson:),
+        objc2::sel!(rvPaste:),
         "v",
         NSEventModifierFlags::Command,
     );
@@ -459,16 +463,16 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     add_menu_item(
         mtm,
         &view_menu,
-        "Copy jq Path",
-        objc2::sel!(rvCopyJq:),
+        "Copy Path",
+        objc2::sel!(rvCopyPath:),
         "c",
         NSEventModifierFlags::Command,
     );
     add_menu_item(
         mtm,
         &view_menu,
-        "Copy JSON Sub-tree",
-        objc2::sel!(rvCopyJson:),
+        "Copy Sub-tree",
+        objc2::sel!(rvCopySubtree:),
         "c",
         NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     );
@@ -544,12 +548,12 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     scroll.setAutohidesScrollers(true);
     scroll.setBorderType(NSBorderType::NoBorder);
 
-    let json_view = JsonView::new(mtm, json_view::initial_frame());
-    scroll.setDocumentView(Some(&json_view));
+    let doc_view = DocView::new(mtm, doc_view::initial_frame());
+    scroll.setDocumentView(Some(&doc_view));
 
     let delegate_obj = delegate as &AnyObject;
     let hb = build_header_bar(mtm, delegate_obj);
-    json_view.set_breadcrumb(hb.breadcrumb.clone());
+    doc_view.set_breadcrumb(hb.breadcrumb.clone());
 
     // Set the delegate on the search field so control:textView:doCommandBySelector:
     // fires for Escape handling, and register for live-as-you-type search.
@@ -602,8 +606,10 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     let id = window_id_of(&window);
     let state = app_state::WindowState {
         window,
-        json_view,
+        doc_view,
         prettify_button: hb.prettify_button,
+        copy_path_button: hb.copy_path_button,
+        copy_subtree_button: hb.copy_subtree_button,
         breadcrumb: hb.breadcrumb,
         search_field: hb.search_field,
         search_count_label: hb.search_count_label,
@@ -626,6 +632,8 @@ struct HeaderBar {
     stack: Retained<NSStackView>,
     breadcrumb: Retained<NSTextField>,
     prettify_button: Retained<NSButton>,
+    copy_path_button: Retained<NSButton>,
+    copy_subtree_button: Retained<NSButton>,
     search_field: Retained<NSTextField>,
     search_count_label: Retained<NSTextField>,
     search_bar: Retained<NSStackView>,
@@ -637,9 +645,9 @@ fn build_header_bar(
 ) -> HeaderBar {
     let cmd = NSEventModifierFlags::Command;
     let clipboard_button =
-        make_icon_button(mtm, "doc.on.clipboard", "Paste from clipboard", target, objc2::sel!(rvPasteJson:));
+        make_icon_button(mtm, "doc.on.clipboard", "Paste from clipboard", target, objc2::sel!(rvPaste:));
     set_key(&clipboard_button, "v", cmd);
-    clipboard_button.setToolTip(Some(&NSString::from_str("Paste JSON from clipboard  ⌘V")));
+    clipboard_button.setToolTip(Some(&NSString::from_str("Paste from clipboard  ⌘V")));
     let clear_button =
         make_icon_button(mtm, "xmark.circle", "Clear document", target, objc2::sel!(rvClearDocument:));
     set_key(&clear_button, "k", cmd);
@@ -647,14 +655,16 @@ fn build_header_bar(
     let prettify_button = make_button_underlined(mtm, "Prettify", 'P', target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
     prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
-    let copy_json_button = make_button(mtm, "Copy JSON", target, objc2::sel!(rvCopyJson:));
-    set_key(&copy_json_button, "c", cmd.union(NSEventModifierFlags::Shift));
-    copy_json_button.setToolTip(Some(&NSString::from_str(
-        "Copy JSON sub-tree at cursor — or entire document if nothing selected (⇧⌘C)",
+    // Title is set to the JSON labels by default; refresh_format_chrome
+    // updates both buttons when a document loads.
+    let copy_subtree_button = make_button(mtm, "Copy JSON", target, objc2::sel!(rvCopySubtree:));
+    set_key(&copy_subtree_button, "c", cmd.union(NSEventModifierFlags::Shift));
+    copy_subtree_button.setToolTip(Some(&NSString::from_str(
+        "Copy sub-tree at cursor — or entire document if nothing selected (⇧⌘C)",
     )));
-    let copy_button = make_button_underlined(mtm, "Copy jq", 'C', target, objc2::sel!(rvCopyJq:));
-    set_key(&copy_button, "c", cmd);
-    copy_button.setToolTip(Some(&NSString::from_str("Copy jq path (⌘C)")));
+    let copy_path_button = make_button_underlined(mtm, "Copy jq", 'C', target, objc2::sel!(rvCopyPath:));
+    set_key(&copy_path_button, "c", cmd);
+    copy_path_button.setToolTip(Some(&NSString::from_str("Copy path expression (⌘C)")));
 
     let label = {
         let s = NSString::from_str(".");
@@ -671,8 +681,8 @@ fn build_header_bar(
         &*clear_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
-        &*copy_json_button as &NSView,
-        &*copy_button as &NSView,
+        &*copy_subtree_button as &NSView,
+        &*copy_path_button as &NSView,
     ]);
     let header = NSStackView::stackViewWithViews(&header_views, mtm);
     header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -726,6 +736,8 @@ fn build_header_bar(
         stack: header,
         breadcrumb: label,
         prettify_button,
+        copy_path_button,
+        copy_subtree_button,
         search_field,
         search_count_label: search_count,
         search_bar,
@@ -882,7 +894,7 @@ fn clear_view(id: WindowId) {
         state.reset_doc_state();
         state.current_path = None;
         state.window.setTitle(&NSString::from_str("Rapid View"));
-        state.json_view.clear_document();
+        state.doc_view.clear_document();
     });
 }
 
@@ -933,8 +945,8 @@ fn load_file_into_window(id: WindowId, path: &str) {
     ensure_poll_timer();
 }
 
-fn copy_jq(id: WindowId) {
-    let expr = with_window(id, |s| s.json_view.current_jq_expression()).unwrap_or_else(|| String::from("."));
+fn copy_path_expression(id: WindowId) {
+    let expr = with_window(id, |s| s.doc_view.current_path_expression()).unwrap_or_else(|| String::from("."));
     let pb = NSPasteboard::generalPasteboard();
     pb.clearContents();
     let ns = NSString::from_str(&expr);
@@ -949,8 +961,8 @@ fn copy_jq(id: WindowId) {
 
 /// Copy the JSON sub-tree at the cursor — or the entire document if
 /// nothing has been clicked yet — to the clipboard.
-fn copy_json(id: WindowId) {
-    let Some(text) = with_window(id, |s| s.json_view.current_json_subtree()).flatten() else {
+fn copy_subtree(id: WindowId) {
+    let Some(text) = with_window(id, |s| s.doc_view.current_subtree()).flatten() else {
         eprintln!("rapid-view: nothing to copy (no document loaded)");
         return;
     };
@@ -968,9 +980,9 @@ fn copy_json(id: WindowId) {
 
 /// Capture the current scroll position + cursor offset from the view.
 fn save_viewport(state: &app_state::WindowState) -> app_state::SavedViewport {
-    let click = state.json_view.last_click_offset();
+    let click = state.doc_view.last_click_offset();
     let scroll = state
-        .json_view
+        .doc_view
         .enclosingScrollView()
         .map(|sv| {
             let bounds = sv.contentView().bounds();
@@ -985,13 +997,13 @@ fn save_viewport(state: &app_state::WindowState) -> app_state::SavedViewport {
 
 /// Restore a previously saved scroll position + cursor offset.
 fn restore_viewport(state: &app_state::WindowState, saved: &app_state::SavedViewport) {
-    state.json_view.set_last_click_offset(saved.click_offset);
-    if let Some(sv) = state.json_view.enclosingScrollView() {
+    state.doc_view.set_last_click_offset(saved.click_offset);
+    if let Some(sv) = state.doc_view.enclosingScrollView() {
         let clip = sv.contentView();
         // Clamp scroll position to the document bounds so we don't
         // end up staring at blank space (e.g. switching from a wide
         // minified view to a narrow pretty-printed one).
-        let doc_frame = state.json_view.frame();
+        let doc_frame = state.doc_view.frame();
         let clip_size = clip.bounds().size;
         let max_x = (doc_frame.size.width - clip_size.width).max(0.0);
         let max_y = (doc_frame.size.height - clip_size.height).max(0.0);
@@ -1015,8 +1027,8 @@ fn dismiss_search(id: WindowId) {
         state.search_bar.setHidden(true);
         state.search_field.setStringValue(&NSString::from_str(""));
         state.search_count_label.setStringValue(&NSString::from_str(""));
-        state.json_view.clear_search();
-        state.window.makeFirstResponder(Some(&state.json_view));
+        state.doc_view.clear_search();
+        state.window.makeFirstResponder(Some(&state.doc_view));
     });
 }
 
@@ -1026,7 +1038,7 @@ fn run_search(id: WindowId) {
         // Don't run incremental search until 4+ chars to avoid
         // scanning large files on every keystroke for short queries.
         if query.len() < 4 {
-            state.json_view.clear_search();
+            state.doc_view.clear_search();
             let label = if query.is_empty() {
                 String::new()
             } else {
@@ -1035,11 +1047,11 @@ fn run_search(id: WindowId) {
             state.search_count_label.setStringValue(&NSString::from_str(&label));
             return;
         }
-        let count = state.json_view.search(&query);
+        let count = state.doc_view.search(&query);
         let label = if count == 0 {
             "No matches".to_string()
         } else {
-            state.json_view.scroll_to_current_match();
+            state.doc_view.scroll_to_current_match();
             if count >= 100_000 {
                 "100,000+ matches".to_string()
             } else {
@@ -1067,7 +1079,7 @@ fn force_search(id: WindowId) {
         if query.is_empty() {
             return;
         }
-        let count = state.json_view.search(&query);
+        let count = state.doc_view.search(&query);
         let label = if count == 0 {
             "No matches".to_string()
         } else if count >= 100_000 {
@@ -1082,9 +1094,9 @@ fn force_search(id: WindowId) {
 fn search_navigate(id: WindowId, forward: bool) {
     with_window(id, |state| {
         let result = if forward {
-            state.json_view.search_next()
+            state.doc_view.search_next()
         } else {
-            state.json_view.search_prev()
+            state.doc_view.search_prev()
         };
         if let Some((idx, total)) = result {
             let label = format!("{} of {}", idx + 1, total);
@@ -1101,7 +1113,7 @@ fn toggle_prettify(id: WindowId) {
     enum Action {
         SwapToOriginal(std::sync::Arc<doc::Document>),
         SwapToCachedPretty(std::sync::Arc<doc::Document>),
-        SpawnPretty(doc::ByteSource),
+        SpawnPretty(Format, doc::ByteSource),
         Nothing,
     }
 
@@ -1119,7 +1131,7 @@ fn toggle_prettify(id: WindowId) {
         state
             .original_doc
             .as_ref()
-            .map(|d| Action::SpawnPretty(d.bytes.clone()))
+            .map(|d| Action::SpawnPretty(d.format, d.bytes.clone()))
             .unwrap_or(Action::Nothing)
     })
     .unwrap_or(Action::Nothing);
@@ -1130,7 +1142,7 @@ fn toggle_prettify(id: WindowId) {
             with_window_mut(id, |state| {
                 state.saved_pretty = save_viewport(state);
                 state.is_pretty = false;
-                state.json_view.set_document(doc);
+                state.doc_view.set_document(doc);
                 let saved = state.saved_original.clone();
                 restore_viewport(state, &saved);
                 set_underlined_title(&state.prettify_button, "Prettify", 'P');
@@ -1142,7 +1154,7 @@ fn toggle_prettify(id: WindowId) {
             with_window_mut(id, |state| {
                 state.saved_original = save_viewport(state);
                 state.is_pretty = true;
-                state.json_view.set_document(doc);
+                state.doc_view.set_document(doc);
                 let saved = state.saved_pretty.clone();
                 restore_viewport(state, &saved);
                 set_underlined_title(&state.prettify_button, "Original", 'O');
@@ -1150,7 +1162,7 @@ fn toggle_prettify(id: WindowId) {
             });
             rerun_search(id);
         }
-        Action::SpawnPretty(source) => {
+        Action::SpawnPretty(fmt, source) => {
             with_window_mut(id, |state| {
                 state.saved_original = save_viewport(state);
                 state.is_pretty = true;
@@ -1162,7 +1174,7 @@ fn toggle_prettify(id: WindowId) {
             });
             let tx = ensure_worker_channel();
             app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            worker::spawn_prettify(id, source, tx);
+            worker::spawn_prettify(id, fmt, source, tx);
             ensure_poll_timer();
         }
     }
@@ -1256,14 +1268,31 @@ fn drain_worker() {
 fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &str) {
     let size = doc.bytes.len();
     let lines = doc.line_count();
-    eprintln!("loaded {} ({} bytes, {} lines)", path, size, lines);
+    let fmt = doc.format;
+    eprintln!("loaded {} ({} bytes, {} lines, {:?})", path, size, lines, fmt);
     with_window_mut(id, |state| {
         state.reset_doc_state();
         state.original_doc = Some(doc.clone());
         state.current_path = Some(path.to_string());
-        state.json_view.set_document(doc);
+        state.doc_view.set_document(doc);
+        refresh_format_chrome(state, fmt);
         refresh_title(state);
     });
+}
+
+/// Update toolbar button titles to reflect the loaded document's
+/// format ("Copy jq" / "Copy XPath", "Copy JSON" / "Copy XML").
+fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
+    let path_label = format::path_label(fmt);
+    let content_label = format::content_label(fmt);
+    set_underlined_title(
+        &state.copy_path_button,
+        &format!("Copy {}", path_label),
+        'C',
+    );
+    state
+        .copy_subtree_button
+        .setTitle(&NSString::from_str(&format!("Copy {}", content_label)));
 }
 
 fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
@@ -1274,7 +1303,7 @@ fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
         // at click time), install it; otherwise keep the cache for
         // the next toggle.
         if state.is_pretty {
-            state.json_view.set_document(doc);
+            state.doc_view.set_document(doc);
             // First prettify — scroll to top since the layout changed
             // drastically (single minified line → many short lines).
             let default_vp = app_state::SavedViewport::default();
