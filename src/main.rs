@@ -27,10 +27,10 @@ use objc2_app_kit::{
     NSBorderType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSImage,
     NSImageSymbolConfiguration, NSImageSymbolScale, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponse,
-    NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSScrollView, NSStackView,
-    NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTabbingMode,
+    NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScrollView, NSStackView, NSStackViewDistribution,
+    NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{
     NSArray, NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol,
@@ -43,9 +43,10 @@ mod app_state {
     //! the worker thread talks back via mpsc, so we don't need a Mutex here.
     use crate::doc::Document;
     use crate::doc_view::DocView;
+    use crate::format::ProgressSink;
     use crate::worker::{WindowId, WorkerChannel};
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSButton, NSStackView, NSTextField, NSWindow};
+    use objc2_app_kit::{NSButton, NSProgressIndicator, NSStackView, NSTextField, NSWindow};
     use objc2_foundation::NSTimer;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -70,13 +71,20 @@ mod app_state {
         pub copy_path_button: Retained<NSButton>,
         /// "Copy JSON" / "Copy XML" — title updates when a doc loads.
         pub copy_subtree_button: Retained<NSButton>,
-        /// Kept alive so the view's weak reference to the breadcrumb
-        /// label stays valid for the window's lifetime.
-        #[allow(dead_code)]
+        /// Path label in the header. Hidden during loads so the
+        /// progress bar can use the same slot without resizing the
+        /// header.
         pub breadcrumb: Retained<NSTextField>,
         pub search_field: Retained<NSTextField>,
         pub search_count_label: Retained<NSTextField>,
         pub search_bar: Retained<NSStackView>,
+        /// Thin determinate bar shown beneath the header during loads
+        /// and prettify re-parses. Hidden when no work is in flight.
+        pub progress_bar: Retained<NSProgressIndicator>,
+        /// Set when a parser is running so the poll-timer tick can read
+        /// `bytes_done` and update `progress_bar.doubleValue`. Cleared
+        /// on DocumentReady / PrettyReady / Error.
+        pub progress: Option<Arc<ProgressSink>>,
         pub current_path: Option<String>,
         pub original_doc: Option<Arc<Document>>,
         pub pretty_doc: Option<Arc<Document>>,
@@ -614,6 +622,8 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         search_field: hb.search_field,
         search_count_label: hb.search_count_label,
         search_bar: hb.search_bar,
+        progress_bar: hb.progress_bar,
+        progress: None,
         current_path: None,
         original_doc: None,
         pretty_doc: None,
@@ -637,6 +647,7 @@ struct HeaderBar {
     search_field: Retained<NSTextField>,
     search_count_label: Retained<NSTextField>,
     search_bar: Retained<NSStackView>,
+    progress_bar: Retained<NSProgressIndicator>,
 }
 
 fn build_header_bar(
@@ -676,11 +687,24 @@ fn build_header_bar(
         tf
     };
 
+    // Progress bar lives in the breadcrumb's slot — they share the
+    // flexible middle of the header and are mutually exclusive
+    // (loading → bar visible, idle → breadcrumb visible). Same slot
+    // means the header never grows or shrinks.
+    let progress_bar = NSProgressIndicator::new(mtm);
+    progress_bar.setStyle(NSProgressIndicatorStyle::Bar);
+    progress_bar.setIndeterminate(false);
+    progress_bar.setMinValue(0.0);
+    progress_bar.setMaxValue(1.0);
+    progress_bar.setDoubleValue(0.0);
+    progress_bar.setHidden(true);
+
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
         &*clipboard_button as &NSView,
         &*clear_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
+        &*progress_bar as &NSView,
         &*copy_subtree_button as &NSView,
         &*copy_path_button as &NSView,
     ]);
@@ -697,6 +721,12 @@ fn build_header_bar(
     header.setHuggingPriority_forOrientation(249.0, NSLayoutConstraintOrientation::Horizontal);
     label.setContentHuggingPriority_forOrientation(10.0, NSLayoutConstraintOrientation::Horizontal);
     label.setContentCompressionResistancePriority_forOrientation(
+        100.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+    progress_bar
+        .setContentHuggingPriority_forOrientation(10.0, NSLayoutConstraintOrientation::Horizontal);
+    progress_bar.setContentCompressionResistancePriority_forOrientation(
         100.0,
         NSLayoutConstraintOrientation::Horizontal,
     );
@@ -741,6 +771,7 @@ fn build_header_bar(
         search_field,
         search_count_label: search_count,
         search_bar,
+        progress_bar,
     }
 }
 
@@ -1235,25 +1266,39 @@ fn drain_worker() {
 
     for msg in msgs {
         match msg {
+            WorkerMsg::ParseStarted {
+                window_id,
+                progress,
+            } => {
+                on_parse_started(window_id, progress);
+                // ParseStarted is a progress event, not terminal —
+                // it must not decrement WORK_PENDING.
+            }
             WorkerMsg::DocumentReady {
                 window_id,
                 doc,
                 path,
             } => {
                 on_document_ready(window_id, doc, &path);
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             WorkerMsg::PrettyReady { window_id, doc } => {
                 on_pretty_ready(window_id, doc);
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             WorkerMsg::Error { window_id, message } => {
                 eprintln!("rapid-view: {}", message);
                 with_window_mut(window_id, |state| {
                     state.window.setTitle(&NSString::from_str("Rapid View"));
+                    hide_progress(state);
                 });
+                app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
+
+    // Tick progress bars for any window with a live parse.
+    tick_progress_bars();
 
     if app_state::WORK_PENDING.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
         app_state::POLL_TIMER.with(|slot| {
@@ -1263,6 +1308,37 @@ fn drain_worker() {
             *slot.borrow_mut() = None;
         });
     }
+}
+
+fn on_parse_started(id: WindowId, progress: std::sync::Arc<format::ProgressSink>) {
+    with_window_mut(id, |state| {
+        state.progress = Some(progress);
+        state.progress_bar.setDoubleValue(0.0);
+        // The bar takes the breadcrumb's slot in the header so the
+        // window height never changes during loads.
+        state.breadcrumb.setHidden(true);
+        state.progress_bar.setHidden(false);
+    });
+}
+
+fn hide_progress(state: &mut app_state::WindowState) {
+    state.progress = None;
+    state.progress_bar.setHidden(true);
+    state.progress_bar.setDoubleValue(0.0);
+    state.breadcrumb.setHidden(false);
+}
+
+/// Push the latest fraction from each window's progress sink into its
+/// progress bar. Cheap (one Relaxed load + a setDoubleValue) so we can
+/// do it on every 60 Hz poll tick.
+fn tick_progress_bars() {
+    app_state::WINDOWS.with(|m| {
+        for state in m.borrow().values() {
+            if let Some(p) = &state.progress {
+                state.progress_bar.setDoubleValue(p.fraction());
+            }
+        }
+    });
 }
 
 fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &str) {
@@ -1277,6 +1353,7 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
         state.doc_view.set_document(doc);
         refresh_format_chrome(state, fmt);
         refresh_title(state);
+        hide_progress(state);
     });
 }
 
@@ -1297,6 +1374,7 @@ fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
 
 fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
     with_window_mut(id, |state| {
+        hide_progress(state);
         state.pretty_doc = Some(doc.clone());
         state.pretty_pending = false;
         // If the user is still asking for pretty (set optimistically

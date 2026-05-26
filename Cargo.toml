@@ -66,6 +66,7 @@ features = [
     "NSParagraphStyle",
     "NSText",
     "NSTextView",
+    "NSProgressIndicator",
 ]
 
 [dependencies.objc2-core-text]

@@ -8,7 +8,7 @@
 //! `Arc`-wrapped — so the worker thread and the main thread can share
 //! the same bytes.
 
-use crate::format::{self, Format, ParseOutput};
+use crate::format::{self, Format, ParseOutput, ProgressSink};
 use memmap2::Mmap;
 use std::sync::Arc;
 
@@ -45,8 +45,12 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn from_source(format: Format, bytes: ByteSource) -> Arc<Self> {
-        let output = format::parse(format, bytes.as_slice());
+    pub fn from_source(
+        format: Format,
+        bytes: ByteSource,
+        progress: Option<&ProgressSink>,
+    ) -> Arc<Self> {
+        let output = format::parse(format, bytes.as_slice(), progress);
         let max_line_bytes = max_line_length(&output.line_starts, bytes.len() as u32);
         Arc::new(Self {
             bytes,

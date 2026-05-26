@@ -8,7 +8,7 @@
 //! anything fancier would be overhead.
 
 use crate::doc::{ByteSource, Document};
-use crate::format::{self, Format};
+use crate::format::{self, Format, ProgressSink};
 use memmap2::Mmap;
 use std::fs::File;
 use std::sync::Arc;
@@ -22,6 +22,13 @@ use std::thread;
 pub type WindowId = usize;
 
 pub enum WorkerMsg {
+    /// Parsing has begun. Carries a shared progress handle the UI can
+    /// poll to drive a determinate progress bar. Sent before any
+    /// expensive work so the indicator can appear immediately.
+    ParseStarted {
+        window_id: WindowId,
+        progress: Arc<ProgressSink>,
+    },
     /// The original document is ready.
     DocumentReady {
         window_id: WindowId,
@@ -50,22 +57,33 @@ impl WorkerChannel {
 }
 
 /// Spawn a worker that opens `path`, mmaps it, sniffs the format,
-/// parses it, and sends a `DocumentReady` on the channel. Errors come
-/// back as `Error { .. }`.
+/// parses it (publishing progress to a shared sink so the UI can show
+/// a progress bar), and sends a `DocumentReady` on the channel.
+/// Errors come back as `Error { .. }`.
 pub fn spawn_load(window_id: WindowId, path: String, tx: Sender<WorkerMsg>) {
     thread::spawn(move || {
-        let msg = match load(&path) {
-            Ok(doc) => WorkerMsg::DocumentReady {
-                window_id,
-                doc,
-                path,
-            },
-            Err(e) => WorkerMsg::Error {
-                window_id,
-                message: format!("open {}: {}", path, e),
-            },
+        let source = match open_source(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error {
+                    window_id,
+                    message: format!("open {}: {}", path, e),
+                });
+                return;
+            }
         };
-        let _ = tx.send(msg);
+        let format = format::detect(source.as_slice());
+        let progress = Arc::new(ProgressSink::new(source.len() as u64));
+        let _ = tx.send(WorkerMsg::ParseStarted {
+            window_id,
+            progress: progress.clone(),
+        });
+        let doc = Document::from_source(format, source, Some(&progress));
+        let _ = tx.send(WorkerMsg::DocumentReady {
+            window_id,
+            doc,
+            path,
+        });
     });
 }
 
@@ -80,7 +98,16 @@ pub fn spawn_parse_bytes(
 ) {
     thread::spawn(move || {
         let format = format::detect(&bytes);
-        let doc = Document::from_source(format, ByteSource::from_vec(bytes));
+        let progress = Arc::new(ProgressSink::new(bytes.len() as u64));
+        let _ = tx.send(WorkerMsg::ParseStarted {
+            window_id,
+            progress: progress.clone(),
+        });
+        let doc = Document::from_source(
+            format,
+            ByteSource::from_vec(bytes),
+            Some(&progress),
+        );
         let _ = tx.send(WorkerMsg::DocumentReady {
             window_id,
             doc,
@@ -91,7 +118,9 @@ pub fn spawn_parse_bytes(
 
 /// Spawn a worker that pretty-prints the given bytes for `format` and
 /// re-parses the result, returning a second `Document` that main can
-/// swap into the view when the user toggles Prettify.
+/// swap into the view when the user toggles Prettify. Progress is
+/// reported during the re-parse phase only — the prettifier itself
+/// is fast enough that adding a counter would just be noise.
 pub fn spawn_prettify(
     window_id: WindowId,
     format: Format,
@@ -100,22 +129,29 @@ pub fn spawn_prettify(
 ) {
     thread::spawn(move || {
         let pretty_bytes = format::prettify(format, source.as_slice());
-        let doc = Document::from_source(format, ByteSource::from_vec(pretty_bytes));
+        let progress = Arc::new(ProgressSink::new(pretty_bytes.len() as u64));
+        let _ = tx.send(WorkerMsg::ParseStarted {
+            window_id,
+            progress: progress.clone(),
+        });
+        let doc = Document::from_source(
+            format,
+            ByteSource::from_vec(pretty_bytes),
+            Some(&progress),
+        );
         let _ = tx.send(WorkerMsg::PrettyReady { window_id, doc });
     });
 }
 
-fn load(path: &str) -> Result<Arc<Document>, String> {
+fn open_source(path: &str) -> Result<ByteSource, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    let source = if metadata.len() == 0 {
-        ByteSource::from_vec(Vec::new())
+    if metadata.len() == 0 {
+        Ok(ByteSource::from_vec(Vec::new()))
     } else {
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-        ByteSource::Mmap(Arc::new(mmap))
-    };
-    let format = format::detect(source.as_slice());
-    Ok(Document::from_source(format, source))
+        Ok(ByteSource::Mmap(Arc::new(mmap)))
+    }
 }
 
 #[cfg(test)]
@@ -125,15 +161,25 @@ mod tests {
 
     const TEST_WINDOW_ID: WindowId = 0xDEADBEEF;
 
+    /// Drain `ParseStarted` (always sent first now) and return the
+    /// next worker message — the one tests actually want to assert on.
+    fn recv_after_started(chan: &WorkerChannel) -> WorkerMsg {
+        let first = chan
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ParseStarted should arrive within 5s");
+        assert!(matches!(first, WorkerMsg::ParseStarted { .. }));
+        chan.rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("terminal message should follow ParseStarted within 5s")
+    }
+
     #[test]
     fn spawn_load_fixture_via_channel() {
         let chan = WorkerChannel::new();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample.json").to_string();
         spawn_load(TEST_WINDOW_ID, path, chan.tx.clone());
-        let msg = chan
-            .rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("worker should produce a result within 5s");
+        let msg = recv_after_started(&chan);
         match msg {
             WorkerMsg::DocumentReady {
                 window_id,
@@ -149,6 +195,7 @@ mod tests {
             }
             WorkerMsg::Error { message, .. } => panic!("unexpected worker error: {}", message),
             WorkerMsg::PrettyReady { .. } => panic!("got PrettyReady from spawn_load"),
+            WorkerMsg::ParseStarted { .. } => panic!("expected DocumentReady, got ParseStarted"),
         }
     }
 
@@ -159,10 +206,7 @@ mod tests {
         let source = ByteSource::Owned(compact.clone());
         let chan = WorkerChannel::new();
         spawn_prettify(TEST_WINDOW_ID, Format::Json, source, chan.tx.clone());
-        let msg = chan
-            .rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("pretty worker should finish within 5s");
+        let msg = recv_after_started(&chan);
         match msg {
             WorkerMsg::PrettyReady { window_id, doc } => {
                 assert_eq!(window_id, TEST_WINDOW_ID);
@@ -172,5 +216,33 @@ mod tests {
             }
             _ => panic!("wrong message type"),
         }
+    }
+
+    #[test]
+    fn progress_reaches_total_on_load() {
+        // After a load completes, the sink's bytes_done should equal
+        // the file length — both the per-MB updates and the final
+        // sentinel store at the end of parse_with_progress contribute.
+        let chan = WorkerChannel::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample.json").to_string();
+        spawn_load(TEST_WINDOW_ID, path, chan.tx.clone());
+        let first = chan
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ParseStarted within 5s");
+        let progress = match first {
+            WorkerMsg::ParseStarted { progress, .. } => progress,
+            _ => panic!("expected ParseStarted first"),
+        };
+        // Drain DocumentReady so the parser has finished.
+        let _ = chan
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("DocumentReady within 5s");
+        assert_eq!(
+            progress.bytes_done.load(std::sync::atomic::Ordering::Relaxed),
+            progress.total,
+        );
+        assert!((progress.fraction() - 1.0).abs() < 1e-9);
     }
 }

@@ -12,9 +12,10 @@
 //! the viewer can display broken files up to the point they go wrong.
 
 use super::{
-    NameInterner, Offset, ParseError, ParseErrorKind, ParseOutput, PathEntry, PathIndex,
-    PathSegment, ROOT_PARENT, StyleKind, StyleSpan,
+    NameInterner, Offset, PROGRESS_GRANULARITY, ParseError, ParseErrorKind, ParseOutput,
+    PathEntry, PathIndex, PathSegment, ProgressSink, ROOT_PARENT, StyleKind, StyleSpan,
 };
+use std::sync::atomic::Ordering;
 
 struct Parser<'a> {
     input: &'a [u8],
@@ -24,10 +25,20 @@ struct Parser<'a> {
     styles: Vec<StyleSpan>,
     names: NameInterner,
     scratch: Vec<u8>,
+    progress: Option<&'a ProgressSink>,
+    /// Next `pos` value at which we'll publish progress. Set to
+    /// `usize::MAX` when there's no sink so the hot-path branch is
+    /// effectively dead.
+    next_progress_at: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a [u8]) -> Self {
+    fn new(input: &'a [u8], progress: Option<&'a ProgressSink>) -> Self {
+        let next_progress_at = if progress.is_some() {
+            PROGRESS_GRANULARITY
+        } else {
+            usize::MAX
+        };
         Self {
             input,
             pos: 0,
@@ -36,6 +47,8 @@ impl<'a> Parser<'a> {
             styles: Vec::new(),
             names: NameInterner::default(),
             scratch: Vec::with_capacity(64),
+            progress,
+            next_progress_at,
         }
     }
 
@@ -51,7 +64,21 @@ impl<'a> Parser<'a> {
             self.line_starts.push((self.pos + 1) as u32);
         }
         self.pos += 1;
+        if self.pos >= self.next_progress_at {
+            self.flush_progress();
+        }
         Some(b)
+    }
+
+    /// Cold path: publish current `pos` to the progress sink and bump
+    /// the next threshold. `#[cold]` keeps the hot path tight.
+    #[cold]
+    #[inline(never)]
+    fn flush_progress(&mut self) {
+        if let Some(p) = self.progress {
+            p.bytes_done.store(self.pos as u64, Ordering::Relaxed);
+        }
+        self.next_progress_at = self.pos + PROGRESS_GRANULARITY;
     }
 
     fn skip_ws(&mut self) {
@@ -430,9 +457,13 @@ fn parse_hex4(bytes: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-pub fn parse(input: &[u8]) -> ParseOutput {
-    let mut p = Parser::new(input);
+pub fn parse(input: &[u8], progress: Option<&ProgressSink>) -> ParseOutput {
+    let mut p = Parser::new(input, progress);
     let err = p.parse_document().err();
+    if let Some(sink) = progress {
+        sink.bytes_done
+            .store(input.len() as u64, Ordering::Relaxed);
+    }
     p.finish(err)
 }
 
@@ -660,21 +691,21 @@ mod tests {
 
     #[test]
     fn empty_object() {
-        let out = parse(b"{}");
+        let out = parse(b"{}", None);
         assert!(out.error.is_none());
         assert_eq!(out.paths.entries.len(), 1);
     }
 
     #[test]
     fn empty_array() {
-        let out = parse(b"[]");
+        let out = parse(b"[]", None);
         assert!(out.error.is_none());
         assert_eq!(out.paths.entries.len(), 1);
     }
 
     #[test]
     fn scalar_document() {
-        let out = parse(b"42");
+        let out = parse(b"42", None);
         assert!(out.error.is_none());
         assert_eq!(out.paths.entries.len(), 1);
     }
@@ -682,7 +713,7 @@ mod tests {
     #[test]
     fn nested_path_lookup() {
         let src = br#"{"a":{"b":[1,2,3]}}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none(), "error: {:?}", out.error);
 
         let pos = offset_of(src, b'2');
@@ -698,7 +729,7 @@ mod tests {
     #[test]
     fn weird_key_needs_brackets() {
         let src = br#"{"has space":1}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
@@ -709,7 +740,7 @@ mod tests {
     #[test]
     fn leading_index_prepends_dot() {
         let src = b"[10,20,30]";
-        let out = parse(src);
+        let out = parse(src, None);
         let pos = offset_of(src, b'2');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
@@ -719,7 +750,7 @@ mod tests {
     #[test]
     fn root_lookup_empty_path() {
         let src = b"   {   }   ";
-        let out = parse(src);
+        let out = parse(src, None);
         let entry = out.paths.lookup(0).unwrap();
         let path = out.paths.path_of(entry);
         assert!(path.is_empty());
@@ -729,7 +760,7 @@ mod tests {
     #[test]
     fn line_index_simple() {
         let src = b"{\n  \"a\": 1\n}";
-        let out = parse(src);
+        let out = parse(src, None);
         assert_eq!(out.line_starts, vec![0, 2, 11]);
     }
 
@@ -737,7 +768,7 @@ mod tests {
     fn unicode_escape_in_key() {
         // {"é":1}  → key "é"
         let src = br#"{"\u00e9":1}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none(), "error: {:?}", out.error);
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
@@ -749,7 +780,7 @@ mod tests {
     fn surrogate_pair_in_key() {
         // U+1F600 GRINNING FACE = 😀
         let src = br#"{"\uD83D\uDE00":1}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none(), "error: {:?}", out.error);
         let pos = offset_of(src, b'1');
         let entry = out.paths.lookup(pos).unwrap();
@@ -760,7 +791,7 @@ mod tests {
     #[test]
     fn styles_cover_tokens() {
         let src = br#"{"a":1,"b":"x","c":true,"d":null}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         let counts = |k: StyleKind| out.styles.iter().filter(|s| s.kind == k).count();
         assert_eq!(counts(StyleKind::Key), 4);
@@ -773,7 +804,7 @@ mod tests {
     #[test]
     fn lookup_inside_key_returns_field_path() {
         let src = br#"{"a":1}"#;
-        let out = parse(src);
+        let out = parse(src, None);
         let pos = offset_of(src, b'a');
         let entry = out.paths.lookup(pos).unwrap();
         let path = out.paths.path_of(entry);
@@ -781,7 +812,7 @@ mod tests {
     }
 
     fn value_bytes_at(src: &[u8], offset: Offset) -> &[u8] {
-        let out = parse(src);
+        let out = parse(src, None);
         let entry_idx = out.paths.lookup(offset).expect("offset has a path entry");
         let entry = out.paths.entries[entry_idx as usize];
         value_bytes_for_entry(src, &entry)
@@ -823,7 +854,7 @@ mod tests {
 
     #[test]
     fn lenient_on_trailing_garbage() {
-        let out = parse(b"{}  garbage");
+        let out = parse(b"{}  garbage", None);
         assert!(out.error.is_none());
     }
 
@@ -920,7 +951,7 @@ mod tests {
         let size_mb = bytes.len() as f64 / (1024.0 * 1024.0);
 
         let t0 = std::time::Instant::now();
-        let out = parse(bytes);
+        let out = parse(bytes, None);
         let dt = t0.elapsed();
 
         assert!(out.error.is_none(), "parse error: {:?}", out.error);

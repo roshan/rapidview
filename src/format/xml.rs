@@ -10,10 +10,11 @@
 //! wrong.
 
 use super::{
-    NameInterner, Offset, ParseError, ParseErrorKind, ParseOutput, PathEntry, PathIndex,
-    PathSegment, ROOT_PARENT, StyleKind, StyleSpan,
+    NameInterner, Offset, PROGRESS_GRANULARITY, ParseError, ParseErrorKind, ParseOutput,
+    PathEntry, PathIndex, PathSegment, ProgressSink, ROOT_PARENT, StyleKind, StyleSpan,
 };
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 // --- parser ---------------------------------------------------------
 
@@ -27,10 +28,17 @@ struct Parser<'a> {
     /// Stack of open elements: (entry_idx, child_count_per_name).
     /// child_count_per_name lets us assign sibling_index at open time.
     stack: Vec<(u32, HashMap<u32, u32>)>,
+    progress: Option<&'a ProgressSink>,
+    next_progress_at: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a [u8]) -> Self {
+    fn new(input: &'a [u8], progress: Option<&'a ProgressSink>) -> Self {
+        let next_progress_at = if progress.is_some() {
+            PROGRESS_GRANULARITY
+        } else {
+            usize::MAX
+        };
         Self {
             input,
             pos: 0,
@@ -39,6 +47,8 @@ impl<'a> Parser<'a> {
             styles: Vec::new(),
             names: NameInterner::default(),
             stack: Vec::new(),
+            progress,
+            next_progress_at,
         }
     }
 
@@ -59,7 +69,19 @@ impl<'a> Parser<'a> {
             self.line_starts.push((self.pos + 1) as u32);
         }
         self.pos += 1;
+        if self.pos >= self.next_progress_at {
+            self.flush_progress();
+        }
         Some(b)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn flush_progress(&mut self) {
+        if let Some(p) = self.progress {
+            p.bytes_done.store(self.pos as u64, Ordering::Relaxed);
+        }
+        self.next_progress_at = self.pos + PROGRESS_GRANULARITY;
     }
 
     fn err(&self, kind: ParseErrorKind) -> ParseError {
@@ -536,9 +558,13 @@ fn is_name_char(b: u8) -> bool {
     is_name_start(b) || matches!(b, b'0'..=b'9' | b'-' | b'.')
 }
 
-pub fn parse(input: &[u8]) -> ParseOutput {
-    let mut p = Parser::new(input);
+pub fn parse(input: &[u8], progress: Option<&ProgressSink>) -> ParseOutput {
+    let mut p = Parser::new(input, progress);
     let err = p.parse_document().err();
+    if let Some(sink) = progress {
+        sink.bytes_done
+            .store(input.len() as u64, Ordering::Relaxed);
+    }
     p.finish(err)
 }
 
@@ -895,7 +921,7 @@ mod tests {
 
     #[test]
     fn empty_doc_is_root_only() {
-        let out = parse(b"");
+        let out = parse(b"", None);
         assert!(out.error.is_none());
         assert_eq!(out.paths.entries.len(), 1);
         assert!(matches!(out.paths.entries[0].segment, PathSegment::Root));
@@ -904,7 +930,7 @@ mod tests {
     #[test]
     fn single_self_closing() {
         let src = b"<root/>";
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         assert_eq!(out.paths.entries.len(), 2);
         let path = out.paths.path_of(1);
@@ -914,7 +940,7 @@ mod tests {
     #[test]
     fn nested_path_lookup() {
         let src = b"<root><a><b>x</b></a></root>";
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none(), "error: {:?}", out.error);
         // Click on `x`.
         let pos = offset_of(src, b'x');
@@ -926,7 +952,7 @@ mod tests {
     #[test]
     fn sibling_predicate_only_when_ambiguous() {
         let src = b"<root><a/><a/><b/></root>";
-        let out = parse(src);
+        let out = parse(src, None);
         // a is repeated → expect [1], [2]. b is unique → no predicate.
         let mut got = Vec::new();
         for (i, e) in out.paths.entries.iter().enumerate() {
@@ -941,7 +967,7 @@ mod tests {
     #[test]
     fn attribute_path() {
         let src = br#"<root><a name="foo"/></root>"#;
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         // Click inside `name`.
         let pos = src.iter().position(|&b| b == b'n').unwrap() as u32;
@@ -953,7 +979,7 @@ mod tests {
     #[test]
     fn root_click_on_whitespace_gives_slash() {
         let src = b"   <a/>   ";
-        let out = parse(src);
+        let out = parse(src, None);
         let entry = out.paths.lookup(0).unwrap();
         let path = out.paths.path_of(entry);
         assert!(path.is_empty());
@@ -963,7 +989,7 @@ mod tests {
     #[test]
     fn comments_and_pi_are_styled() {
         let src = b"<?xml version=\"1.0\"?><!-- hi --><a/>";
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         let has = |k: StyleKind| out.styles.iter().any(|s| s.kind == k);
         assert!(has(StyleKind::Pi));
@@ -974,7 +1000,7 @@ mod tests {
     #[test]
     fn cdata_is_styled() {
         let src = b"<a><![CDATA[hello]]></a>";
-        let out = parse(src);
+        let out = parse(src, None);
         assert!(out.error.is_none());
         assert!(out.styles.iter().any(|s| s.kind == StyleKind::CData));
     }
@@ -982,7 +1008,7 @@ mod tests {
     #[test]
     fn value_bytes_for_element() {
         let src = b"<root><a>hi</a></root>";
-        let out = parse(src);
+        let out = parse(src, None);
         let pos = offset_of(src, b'h');
         let entry_idx = out.paths.lookup(pos).unwrap();
         let entry = out.paths.entries[entry_idx as usize];
@@ -992,7 +1018,7 @@ mod tests {
     #[test]
     fn value_bytes_for_attribute() {
         let src = br#"<a name="foo"/>"#;
-        let out = parse(src);
+        let out = parse(src, None);
         let pos = src.iter().position(|&b| b == b'n').unwrap() as u32;
         let entry_idx = out.paths.lookup(pos).unwrap();
         let entry = out.paths.entries[entry_idx as usize];
@@ -1038,7 +1064,7 @@ mod tests {
     #[test]
     fn unmatched_close_recovers() {
         let src = b"<root><a></b></root>";
-        let out = parse(src);
+        let out = parse(src, None);
         // Lenient: parse completes without panic.
         let _ = out;
     }
@@ -1046,7 +1072,7 @@ mod tests {
     #[test]
     fn line_starts_tracked() {
         let src = b"<a>\n<b/>\n</a>";
-        let out = parse(src);
+        let out = parse(src, None);
         assert_eq!(out.line_starts, vec![0, 4, 9]);
     }
 }

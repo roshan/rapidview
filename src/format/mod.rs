@@ -10,6 +10,39 @@ pub mod json;
 pub mod xml;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Lock-free progress channel between a parser running on the worker
+/// thread and the UI thread that polls it for a determinate progress
+/// bar. Created by the worker with the file's total byte count; the
+/// parser stores `pos` into `bytes_done` every ~1 MB on the hot path.
+pub struct ProgressSink {
+    pub total: u64,
+    pub bytes_done: AtomicU64,
+}
+
+impl ProgressSink {
+    pub fn new(total: u64) -> Self {
+        Self {
+            total,
+            bytes_done: AtomicU64::new(0),
+        }
+    }
+
+    /// 0.0–1.0 progress fraction. Empty inputs report 1.0 immediately.
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        let done = self.bytes_done.load(Ordering::Relaxed) as f64;
+        (done / self.total as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// How many input bytes between progress-counter updates from a parser.
+/// 1 MB → ~1400 updates on a 1.4 GB file; well under any sane UI refresh
+/// rate and cheap enough to amortise to ~free per byte.
+pub const PROGRESS_GRANULARITY: usize = 1 << 20;
 
 pub type Offset = u32;
 
@@ -207,10 +240,14 @@ pub fn detect(bytes: &[u8]) -> Format {
     Format::Json
 }
 
-pub fn parse(format: Format, input: &[u8]) -> ParseOutput {
+pub fn parse(
+    format: Format,
+    input: &[u8],
+    progress: Option<&ProgressSink>,
+) -> ParseOutput {
     match format {
-        Format::Json => json::parse(input),
-        Format::Xml => xml::parse(input),
+        Format::Json => json::parse(input, progress),
+        Format::Xml => xml::parse(input, progress),
     }
 }
 
