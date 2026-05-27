@@ -1,12 +1,15 @@
 //! Format-agnostic parsing API.
 //!
-//! `detect` sniffs the first non-whitespace byte to pick JSON vs XML.
-//! Parsing produces a `ParseOutput` the renderer treats identically
-//! regardless of source format — the format-specific bits (path
-//! expression, pretty-printer, sub-tree extraction) live behind
-//! dispatch functions that switch on `Format`.
+//! `detect` sniffs the first non-whitespace byte to pick JSON vs XML;
+//! Markdown has no reliable byte signature and is selected from the
+//! file extension via `detect_with_path`. Parsing produces a
+//! `ParseOutput` the renderer treats identically regardless of source
+//! format — the format-specific bits (path expression, pretty-printer,
+//! sub-tree extraction) live behind dispatch functions that switch on
+//! `Format`.
 
 pub mod json;
+pub mod markdown;
 pub mod xml;
 
 use std::collections::HashMap;
@@ -50,6 +53,7 @@ pub type Offset = u32;
 pub enum Format {
     Json,
     Xml,
+    Markdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +71,10 @@ pub enum StyleKind {
     Comment,
     CData,
     Pi,
+    // Markdown
+    Heading,
+    Code,
+    CodeBlock,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +96,10 @@ pub enum PathSegment {
     Element { name: u32, sibling_index: u32 },
     /// XML attribute name (interned).
     Attribute(u32),
+    /// Markdown ATX heading. `level` is 1..=6, `text` is the interned
+    /// heading title with leading hashes and surrounding whitespace
+    /// stripped.
+    Heading { level: u32, text: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,7 +236,8 @@ pub enum ParseErrorKind {
 
 /// Sniff `bytes` to decide format. Skips UTF-8 BOM and leading
 /// whitespace. `<` → XML; anything else → JSON (which is also the
-/// default for empty input).
+/// default for empty input). Markdown is not detected from bytes —
+/// callers with a file path should use [`detect_with_path`].
 pub fn detect(bytes: &[u8]) -> Format {
     let mut i = 0;
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -240,6 +253,23 @@ pub fn detect(bytes: &[u8]) -> Format {
     Format::Json
 }
 
+/// Like [`detect`], but consults the file extension first. Markdown has
+/// no reliable byte signature, so it can only be selected this way; for
+/// other extensions we still fall through to byte sniffing so a file
+/// named `notes.txt` that contains JSON is still treated as JSON.
+pub fn detect_with_path(path: &str, bytes: &[u8]) -> Format {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    if let Some(ext) = ext.as_deref() {
+        if matches!(ext, "md" | "markdown" | "mdown" | "mkd" | "markdn") {
+            return Format::Markdown;
+        }
+    }
+    detect(bytes)
+}
+
 pub fn parse(
     format: Format,
     input: &[u8],
@@ -248,6 +278,7 @@ pub fn parse(
     match format {
         Format::Json => json::parse(input, progress),
         Format::Xml => xml::parse(input, progress),
+        Format::Markdown => markdown::parse(input, progress),
     }
 }
 
@@ -255,6 +286,7 @@ pub fn prettify(format: Format, input: &[u8]) -> Vec<u8> {
     match format {
         Format::Json => json::prettify(input),
         Format::Xml => xml::prettify(input),
+        Format::Markdown => markdown::prettify(input),
     }
 }
 
@@ -266,6 +298,7 @@ pub fn path_expression(
     match format {
         Format::Json => json::path_expression(segments, names),
         Format::Xml => xml::path_expression(segments, names),
+        Format::Markdown => markdown::path_expression(segments, names),
     }
 }
 
@@ -277,15 +310,18 @@ pub fn value_bytes_for_entry<'a>(
     match format {
         Format::Json => json::value_bytes_for_entry(bytes, entry),
         Format::Xml => xml::value_bytes_for_entry(bytes, entry),
+        Format::Markdown => markdown::value_bytes_for_entry(bytes, entry),
     }
 }
 
 /// Short label for the path-expression dialect — used in the toolbar
-/// button title so JSON users see "Copy jq" and XML users see "Copy XPath".
+/// button title so JSON users see "Copy jq", XML users see "Copy XPath",
+/// and Markdown users see "Copy Path".
 pub fn path_label(format: Format) -> &'static str {
     match format {
         Format::Json => "jq",
         Format::Xml => "XPath",
+        Format::Markdown => "Path",
     }
 }
 
@@ -295,6 +331,7 @@ pub fn content_label(format: Format) -> &'static str {
     match format {
         Format::Json => "JSON",
         Format::Xml => "XML",
+        Format::Markdown => "Markdown",
     }
 }
 
@@ -311,5 +348,17 @@ mod tests {
         assert_eq!(detect(b"\n  <?xml version=\"1.0\"?><a/>"), Format::Xml);
         assert_eq!(detect(b"\xEF\xBB\xBF<a/>"), Format::Xml);
         assert_eq!(detect(b""), Format::Json);
+    }
+
+    #[test]
+    fn detect_with_path_picks_markdown_by_extension() {
+        assert_eq!(detect_with_path("notes.md", b"# hi"), Format::Markdown);
+        assert_eq!(detect_with_path("/a/b/README.markdown", b""), Format::Markdown);
+        assert_eq!(detect_with_path("x.MD", b"anything"), Format::Markdown);
+        // Non-markdown extensions still byte-sniff.
+        assert_eq!(detect_with_path("doc.json", b"{\"a\":1}"), Format::Json);
+        assert_eq!(detect_with_path("doc.xml", b"<a/>"), Format::Xml);
+        // Markdown bytes without the right extension fall through to JSON.
+        assert_eq!(detect_with_path("notes.txt", b"# heading"), Format::Json);
     }
 }

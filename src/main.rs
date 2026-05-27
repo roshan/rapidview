@@ -27,7 +27,7 @@ use objc2_app_kit::{
     NSBorderType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSImage,
     NSImageSymbolConfiguration, NSImageSymbolScale, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponse,
-    NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSProgressIndicator,
     NSProgressIndicatorStyle, NSScrollView, NSStackView, NSStackViewDistribution,
     NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask, NSWindowTabbingMode,
@@ -46,7 +46,9 @@ mod app_state {
     use crate::format::ProgressSink;
     use crate::worker::{WindowId, WorkerChannel};
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSButton, NSProgressIndicator, NSStackView, NSTextField, NSWindow};
+    use objc2_app_kit::{
+        NSButton, NSPopUpButton, NSProgressIndicator, NSStackView, NSTextField, NSWindow,
+    };
     use objc2_foundation::NSTimer;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -71,6 +73,10 @@ mod app_state {
         pub copy_path_button: Retained<NSButton>,
         /// "Copy JSON" / "Copy XML" — title updates when a doc loads.
         pub copy_subtree_button: Retained<NSButton>,
+        /// Format selector. Items are [JSON, XML, Markdown] in that
+        /// order; selection is synced from `Document.format` whenever a
+        /// doc loads, and a user-driven change spawns a reparse.
+        pub format_picker: Retained<NSPopUpButton>,
         /// Path label in the header. Hidden during loads so the
         /// progress bar can use the same slot without resizing the
         /// header.
@@ -261,6 +267,16 @@ define_class!(
         fn rv_copy_subtree(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
                 copy_subtree(id);
+            }
+        }
+
+        #[unsafe(method(rvFormatChanged:))]
+        fn rv_format_changed(&self, sender: &NSPopUpButton) {
+            let idx = sender.indexOfSelectedItem();
+            let Some(fmt) = picker_index_to_format(idx) else { return };
+            let sender_obj: &AnyObject = sender.as_ref();
+            if let Some(id) = window_id_from_sender(sender_obj) {
+                change_format(id, fmt);
             }
         }
 
@@ -618,6 +634,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         prettify_button: hb.prettify_button,
         copy_path_button: hb.copy_path_button,
         copy_subtree_button: hb.copy_subtree_button,
+        format_picker: hb.format_picker,
         breadcrumb: hb.breadcrumb,
         search_field: hb.search_field,
         search_count_label: hb.search_count_label,
@@ -642,6 +659,7 @@ struct HeaderBar {
     stack: Retained<NSStackView>,
     breadcrumb: Retained<NSTextField>,
     prettify_button: Retained<NSButton>,
+    format_picker: Retained<NSPopUpButton>,
     copy_path_button: Retained<NSButton>,
     copy_subtree_button: Retained<NSButton>,
     search_field: Retained<NSTextField>,
@@ -666,6 +684,7 @@ fn build_header_bar(
     let prettify_button = make_button_underlined(mtm, "Prettify", 'P', target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
     prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
+    let format_picker = build_format_picker(mtm, target);
     // Title is set to the JSON labels by default; refresh_format_chrome
     // updates both buttons when a document loads.
     let copy_subtree_button = make_button(mtm, "Copy JSON", target, objc2::sel!(rvCopySubtree:));
@@ -703,6 +722,7 @@ fn build_header_bar(
         &*clipboard_button as &NSView,
         &*clear_button as &NSView,
         &*prettify_button as &NSView,
+        &*format_picker as &NSView,
         &*label as &NSView,
         &*progress_bar as &NSView,
         &*copy_subtree_button as &NSView,
@@ -766,12 +786,53 @@ fn build_header_bar(
         stack: header,
         breadcrumb: label,
         prettify_button,
+        format_picker,
         copy_path_button,
         copy_subtree_button,
         search_field,
         search_count_label: search_count,
         search_bar,
         progress_bar,
+    }
+}
+
+/// Build the format selector. Three items in a fixed order so we can
+/// map selection index ↔ Format without consulting titles.
+fn build_format_picker(
+    mtm: MainThreadMarker,
+    target: &AnyObject,
+) -> Retained<NSPopUpButton> {
+    let picker = NSPopUpButton::new(mtm);
+    for title in ["JSON", "XML", "Markdown"] {
+        picker.addItemWithTitle(&NSString::from_str(title));
+    }
+    picker.selectItemAtIndex(0);
+    unsafe {
+        picker.setTarget(Some(target));
+        picker.setAction(Some(objc2::sel!(rvFormatChanged:)));
+    }
+    picker.setToolTip(Some(&NSString::from_str(
+        "Override the auto-detected format",
+    )));
+    picker
+}
+
+/// Selection index ↔ Format mapping. Kept in one place so the picker
+/// always uses a consistent order.
+fn format_to_picker_index(fmt: Format) -> isize {
+    match fmt {
+        Format::Json => 0,
+        Format::Xml => 1,
+        Format::Markdown => 2,
+    }
+}
+
+fn picker_index_to_format(idx: isize) -> Option<Format> {
+    match idx {
+        0 => Some(Format::Json),
+        1 => Some(Format::Xml),
+        2 => Some(Format::Markdown),
+        _ => None,
     }
 }
 
@@ -1357,8 +1418,9 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
     });
 }
 
-/// Update toolbar button titles to reflect the loaded document's
-/// format ("Copy jq" / "Copy XPath", "Copy JSON" / "Copy XML").
+/// Update toolbar button titles and the format picker to reflect the
+/// loaded document's format ("Copy jq" / "Copy XPath" / "Copy Path",
+/// "Copy JSON" / "Copy XML" / "Copy Markdown").
 fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
     let path_label = format::path_label(fmt);
     let content_label = format::content_label(fmt);
@@ -1370,6 +1432,45 @@ fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
     state
         .copy_subtree_button
         .setTitle(&NSString::from_str(&format!("Copy {}", content_label)));
+    state
+        .format_picker
+        .selectItemAtIndex(format_to_picker_index(fmt));
+}
+
+/// User picked a different format from the header picker. Spawn a
+/// reparse of the existing bytes under the new format; `on_document_ready`
+/// will install it like a fresh load (resetting pretty cache and
+/// viewport state). No-op if no document is loaded.
+fn change_format(id: WindowId, fmt: Format) {
+    enum Action {
+        Reparse(doc::ByteSource, String),
+        Nothing,
+    }
+    let action = with_window_mut(id, |state| {
+        let Some(doc) = state.original_doc.as_ref() else {
+            return Action::Nothing;
+        };
+        if doc.format == fmt {
+            return Action::Nothing;
+        }
+        let label = state
+            .current_path
+            .clone()
+            .unwrap_or_else(|| "<document>".to_string());
+        state.window.setTitle(&NSString::from_str(&format!(
+            "Rapid View — reparsing as {}…",
+            format::content_label(fmt)
+        )));
+        Action::Reparse(doc.bytes.clone(), label)
+    })
+    .unwrap_or(Action::Nothing);
+
+    if let Action::Reparse(source, label) = action {
+        let tx = ensure_worker_channel();
+        app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        worker::spawn_reparse(id, fmt, source, label, tx);
+        ensure_poll_timer();
+    }
 }
 
 fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {

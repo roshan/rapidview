@@ -95,6 +95,11 @@ impl Colors {
             // CDATA reads like a string literal; PI like a comment.
             StyleKind::CData => &self.string,
             StyleKind::Pi => &self.comment,
+            // Markdown — heading reuses the structural cyan, code reuses
+            // the string yellow so it reads like literal text.
+            StyleKind::Heading => &self.tag,
+            StyleKind::Code => &self.string,
+            StyleKind::CodeBlock => &self.string,
         }
     }
 }

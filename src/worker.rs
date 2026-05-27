@@ -72,7 +72,7 @@ pub fn spawn_load(window_id: WindowId, path: String, tx: Sender<WorkerMsg>) {
                 return;
             }
         };
-        let format = format::detect(source.as_slice());
+        let format = format::detect_with_path(&path, source.as_slice());
         let progress = Arc::new(ProgressSink::new(source.len() as u64));
         let _ = tx.send(WorkerMsg::ParseStarted {
             window_id,
@@ -108,6 +108,34 @@ pub fn spawn_parse_bytes(
             ByteSource::from_vec(bytes),
             Some(&progress),
         );
+        let _ = tx.send(WorkerMsg::DocumentReady {
+            window_id,
+            doc,
+            path: label,
+        });
+    });
+}
+
+/// Re-parse an already-loaded `ByteSource` under a different `format`.
+/// Used when the user overrides the auto-detected format from the
+/// header picker — the bytes don't change but the parse indexes do.
+/// The result arrives as `DocumentReady` and is installed by
+/// `on_document_ready` exactly like a fresh load, which resets the
+/// pretty cache and viewport state.
+pub fn spawn_reparse(
+    window_id: WindowId,
+    format: Format,
+    source: ByteSource,
+    label: String,
+    tx: Sender<WorkerMsg>,
+) {
+    thread::spawn(move || {
+        let progress = Arc::new(ProgressSink::new(source.len() as u64));
+        let _ = tx.send(WorkerMsg::ParseStarted {
+            window_id,
+            progress: progress.clone(),
+        });
+        let doc = Document::from_source(format, source, Some(&progress));
         let _ = tx.send(WorkerMsg::DocumentReady {
             window_id,
             doc,

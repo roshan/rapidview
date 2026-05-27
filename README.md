@@ -1,9 +1,9 @@
 # Rapid View
 
-A native macOS viewer for JSON and XML files. Written in Rust against AppKit (`objc2`). No Electron, no web view.
+A native macOS viewer for JSON, XML, and Markdown files. Written in Rust against AppKit (`objc2`). No Electron, no web view.
 
-- Click anywhere → header shows the jq path (JSON) or XPath (XML) that points at it.
-- Auto-detects JSON vs XML from the file content.
+- Click anywhere → header shows the jq path (JSON), XPath (XML), or heading path (Markdown) that points at it.
+- Auto-detects JSON vs XML from the file content; Markdown is selected by extension (`.md`, `.markdown`, `.mdown`, `.mkd`).
 - Handles multi-GB files (the 1.4 GB Apple Health export, for instance) without freezing.
 - ⌘F search, vim-style navigation (`hjkl`, `gg`, `G`, `/`, `n`, `N`), prettify toggle.
 - Determinate progress bar in the header during loads — doesn't push the document around.
