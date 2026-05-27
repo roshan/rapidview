@@ -34,6 +34,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
+name = "markdown-core"
+version = "0.1.0"
+
+[[package]]
+name = "markview"
+version = "0.1.0"
+dependencies = [
+ "markdown-core",
+ "memmap2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "memmap2"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -2,25 +2,31 @@
 
 Native macOS viewer for JSON and XML files. Rust + AppKit via `objc2`/`objc2-app-kit`. No Electron, no web view. Multi-window with AppKit auto-tabbing.
 
+This repo is a Cargo workspace. **Rapid View** (this crate) is one of three members; the others are **Markview** (a separate macOS app for markdown — see `markview/`) and **markdown-core** (the parser Markview depends on). Rapid View itself only handles JSON and XML; markdown lives in Markview because rendering it requires very different presentation.
+
 ## File layout
 
 ```
-src/format/mod.rs   shared types + dispatch (Format, ParseOutput, PathSegment,
-                    StyleSpan, NameInterner, ProgressSink, plus detect/parse/
-                    prettify/path_expression/value_bytes_for_entry dispatch fns)
-src/format/json.rs  JSON tokenizer + jq path formatter + prettifier
-src/format/xml.rs   XML tokenizer + XPath formatter + two-pass prettifier
-                    (classify each element as block-or-mixed, then emit)
-src/doc.rs          Document = bytes + format + ParseOutput + max_line_bytes.
-                    ByteSource is Arc<Mmap> for files, Arc<[u8]> for clipboard
-                    and prettify output.
-src/doc_view.rs     DocView, NSView subclass. Fixed monospace font →
-                    constant line height + advance → drawRect: picks the
-                    visible byte range and paints with CoreText.
-src/worker.rs       Background thread per request, mpsc back to main, drained
-                    by a 16 ms NSTimer that tears itself down on idle.
-src/main.rs         AppDelegate, window/tab management, menu bar, toolbar,
-                    worker-message dispatch.
+src/format/mod.rs    shared types + dispatch (Format, ParseOutput, PathSegment,
+                     StyleSpan, NameInterner, ProgressSink, plus detect/parse/
+                     prettify/path_expression/value_bytes_for_entry dispatch fns)
+src/format/json.rs   JSON tokenizer + jq path formatter + prettifier
+src/format/xml.rs    XML tokenizer + XPath formatter + two-pass prettifier
+                     (classify each element as block-or-mixed, then emit)
+src/doc.rs           Document = bytes + format + ParseOutput + max_line_bytes.
+                     ByteSource is Arc<Mmap> for files, Arc<[u8]> for clipboard
+                     and prettify output.
+src/doc_view.rs      DocView, NSView subclass. Fixed monospace font →
+                     constant line height + advance → drawRect: picks the
+                     visible byte range and paints with CoreText.
+src/worker.rs        Background thread per request, mpsc back to main, drained
+                     by a 16 ms NSTimer that tears itself down on idle.
+src/main.rs          AppDelegate, window/tab management, menu bar, toolbar,
+                     worker-message dispatch.
+markdown-core/       Markdown parser + types (path tree + per-line BlockKind
+                     classification). Used by Markview, not by Rapid View.
+markview/            Separate binary crate — Markview app. NSTextView-based
+                     viewer with rendered/source mode toggle.
 ```
 
 The renderer is format-agnostic — `ParseOutput` is identical between JSON and XML. Anything format-specific (path expression, sub-tree extraction, pretty-printer) dispatches on `Format` at the call site, e.g. `format::path_expression(doc.format, ...)`.
@@ -36,11 +42,13 @@ The renderer is format-agnostic — `ParseOutput` is identical between JSON and 
 ## Build / test / deploy
 
 ```sh
-cargo build               # debug
-cargo test                # all unit + integration tests
-cargo run -- some.json    # run from source against a file
-./bundle.sh release       # build the .app (writes to $CARGO_TARGET_DIR/release)
-mise run deploy           # build + codesign --sign - + install to /Applications
+cargo build -p rapid-view             # debug
+cargo test --workspace                # all unit + integration tests across crates
+cargo run -p rapid-view -- some.json  # run from source against a file
+./bundle.sh release                   # build the .app (writes to $CARGO_TARGET_DIR/release)
+mise run deploy                       # build + codesign --sign - + install to /Applications
+mise run deploy-markview              # same, for Markview.app
+mise run deploy-all                   # both apps in one go
 ```
 
 `Info.plist` declares `public.json` and `public.xml` as `LSHandlerRank=Alternate` so Rapid View is offered as a viewer but doesn't fight other apps for ownership.

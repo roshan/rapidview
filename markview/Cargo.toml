@@ -1,13 +1,14 @@
-[workspace]
-resolver = "2"
-members = [".", "markdown-core", "markview"]
-
 [package]
-name = "rapid-view"
+name = "markview"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "markview"
+path = "src/main.rs"
+
 [dependencies]
+markdown-core = { path = "../markdown-core" }
 memmap2 = "0.9"
 
 [dependencies.objc2]
@@ -31,7 +32,6 @@ features = [
     "NSValue",
     "NSThread",
 ]
-
 
 [dependencies.objc2-app-kit]
 version = "0.3"
@@ -70,35 +70,8 @@ features = [
     "NSParagraphStyle",
     "NSText",
     "NSTextView",
+    "NSTextStorage",
+    "NSTextContainer",
+    "NSLayoutManager",
     "NSProgressIndicator",
 ]
-
-[dependencies.objc2-core-text]
-version = "0.3"
-features = [
-    "CTLine",
-    "CTFont",
-    "CTStringAttributes",
-    "CTFontDescriptor",
-]
-
-[dependencies.objc2-core-graphics]
-version = "0.3"
-features = [
-    "CGContext",
-    "CGColor",
-    "CGColorSpace",
-    "CGGeometry",
-    "CGAffineTransform",
-]
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = "symbols"
-incremental = false
-
-[profile.release.package."*"]
-opt-level = 3
