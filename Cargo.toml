@@ -52,7 +52,6 @@ features = [
     "NSFontDescriptor",
     "NSFontManager",
     "NSButton",
-    "NSPopUpButton",
     "NSImage",
     "NSStackView",
     "NSLayoutConstraint",

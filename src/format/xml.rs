@@ -595,10 +595,8 @@ pub fn path_expression(segments: &[PathSegment], names: &NameInterner) -> String
                 let bytes = names.get(*id);
                 out.push_str(std::str::from_utf8(bytes).unwrap_or("\u{FFFD}"));
             }
-            // Non-XML segments shouldn't appear in an XML doc — be safe.
-            PathSegment::Key(_)
-            | PathSegment::Index(_)
-            | PathSegment::Heading { .. } => {}
+            // JSON segments shouldn't appear in an XML doc — be safe.
+            PathSegment::Key(_) | PathSegment::Index(_) => {}
         }
     }
     out
@@ -617,7 +615,7 @@ pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8]
         PathSegment::Root => slice.trim_ascii(),
         PathSegment::Element { .. } => slice,
         PathSegment::Attribute(_) => extract_attr_value(slice),
-        PathSegment::Key(_) | PathSegment::Index(_) | PathSegment::Heading { .. } => slice,
+        PathSegment::Key(_) | PathSegment::Index(_) => slice,
     }
 }
 

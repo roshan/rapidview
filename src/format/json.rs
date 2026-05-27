@@ -503,10 +503,8 @@ pub fn path_expression(segments: &[PathSegment], names: &NameInterner) -> String
                 use std::fmt::Write;
                 let _ = write!(out, "[{}]", i);
             }
-            // Non-JSON segments shouldn't appear in a JSON doc — be safe.
-            PathSegment::Element { .. }
-            | PathSegment::Attribute(_)
-            | PathSegment::Heading { .. } => {}
+            // XML segments shouldn't appear in a JSON doc — be safe.
+            PathSegment::Element { .. } | PathSegment::Attribute(_) => {}
         }
     }
     // When the first segment is an index, `out` starts with `[` — jq
@@ -536,9 +534,7 @@ pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8]
         PathSegment::Root => slice.trim_ascii(),
         PathSegment::Index(_) => slice,
         PathSegment::Key(_) => skip_key_and_colon(slice),
-        PathSegment::Element { .. }
-        | PathSegment::Attribute(_)
-        | PathSegment::Heading { .. } => slice,
+        PathSegment::Element { .. } | PathSegment::Attribute(_) => slice,
     }
 }
 
