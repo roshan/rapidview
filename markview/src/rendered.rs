@@ -7,12 +7,12 @@
 //! machine — they aren't tracked by the parser because the source view
 //! doesn't need them.
 //!
-//! Tables and fenced code blocks both render as monospace pre blocks
-//! with a soft background. Tables aren't laid out as real columns —
-//! the source bytes are echoed verbatim and rely on the author having
-//! aligned them, which is how everyone writes markdown tables anyway.
+//! Fenced code blocks render as monospace pre blocks with a soft
+//! background. Tables lay out as real columns via `NSTextTable`, with
+//! per-column alignment driven by the `| :--- | :---: | ---: |`
+//! separator row when present.
 
-use markdown_core::{BlockKind, BlockLine, ParseOutput};
+use markdown_core::{BlockKind, BlockLine, CellAlign, ParseOutput};
 use objc2::AnyThread;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
@@ -20,11 +20,13 @@ use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSBackgroundColorAttributeName, NSColor, NSFont, NSFontAttributeName, NSFontManager,
     NSFontTraitMask, NSForegroundColorAttributeName, NSLinkAttributeName,
-    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSUnderlineStyle,
-    NSUnderlineStyleAttributeName,
+    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextBlock,
+    NSTextBlockLayer, NSTextBlockValueType, NSTextTable, NSTextTableBlock,
+    NSTextTableLayoutAlgorithm, NSUnderlineStyle, NSUnderlineStyleAttributeName,
 };
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSMutableAttributedString, NSNumber, NSString,
+    NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString, NSNumber, NSRectEdge,
+    NSString,
 };
 
 const BODY_SIZE: f64 = 14.0;
@@ -98,7 +100,7 @@ pub fn build(
                         lines.get(li).copied().unwrap_or("")
                     })
                     .collect();
-                b.emit_pre_block(&run_lines);
+                b.emit_table(&run_lines);
                 i = end;
                 continue;
             }
@@ -155,6 +157,8 @@ struct Builder {
     pre_bg: Retained<NSColor>,
     quote_rule_color: Retained<NSColor>,
     link_color: Retained<NSColor>,
+    table_border_color: Retained<NSColor>,
+    table_header_bg: Retained<NSColor>,
 }
 
 impl Builder {
@@ -184,6 +188,12 @@ impl Builder {
             pre_bg: NSColor::colorWithCalibratedRed_green_blue_alpha(0.50, 0.50, 0.50, 0.10),
             quote_rule_color: NSColor::tertiaryLabelColor(),
             link_color: NSColor::linkColor(),
+            table_border_color: NSColor::colorWithCalibratedRed_green_blue_alpha(
+                0.50, 0.50, 0.50, 0.45,
+            ),
+            table_header_bg: NSColor::colorWithCalibratedRed_green_blue_alpha(
+                0.50, 0.50, 0.50, 0.15,
+            ),
         }
     }
 
@@ -299,6 +309,139 @@ impl Builder {
         self.emit_pre_block(inner);
     }
 
+    fn emit_table(&self, lines: &[&str]) {
+        // Parse cells per row. If the second row is a valid separator
+        // (`| :--- | ---: |`), treat the first row as a header and use
+        // its alignments. Otherwise render every line as a body row with
+        // left alignment.
+        let rows: Vec<Vec<String>> = lines
+            .iter()
+            .map(|l| markdown_core::split_table_row(l))
+            .collect();
+        if rows.is_empty() || rows.iter().all(|r| r.is_empty()) {
+            return;
+        }
+        let (has_header, aligns, body_start) = if rows.len() >= 2 {
+            if let Some(a) = markdown_core::parse_table_separator(lines[1]) {
+                (true, a, 2)
+            } else {
+                (false, Vec::new(), 0)
+            }
+        } else {
+            (false, Vec::new(), 0)
+        };
+        let mut ncols = aligns.len();
+        for row in &rows {
+            ncols = ncols.max(row.len());
+        }
+        if ncols == 0 {
+            return;
+        }
+        let mut aligns = aligns;
+        aligns.resize(ncols, CellAlign::Left);
+
+        let table = NSTextTable::new();
+        table.setNumberOfColumns(ncols);
+        table.setLayoutAlgorithm(NSTextTableLayoutAlgorithm::AutomaticLayoutAlgorithm);
+        table.setCollapsesBorders(true);
+        table.setHidesEmptyCells(false);
+
+        let total_rows = if has_header {
+            1 + rows.len().saturating_sub(body_start)
+        } else {
+            rows.len()
+        };
+
+        let mut row_idx: usize = 0;
+        if has_header {
+            self.emit_table_row(&table, &rows[0], ncols, &aligns, row_idx, true, total_rows);
+            row_idx += 1;
+        }
+        for body in rows.iter().skip(body_start) {
+            self.emit_table_row(&table, body, ncols, &aligns, row_idx, false, total_rows);
+            row_idx += 1;
+        }
+    }
+
+    fn emit_table_row(
+        &self,
+        table: &NSTextTable,
+        cells: &[String],
+        ncols: usize,
+        aligns: &[CellAlign],
+        row: usize,
+        header: bool,
+        total_rows: usize,
+    ) {
+        let is_last_row = row + 1 == total_rows;
+        for c in 0..ncols {
+            let cell_text = cells.get(c).map(String::as_str).unwrap_or("");
+            let block = NSTextTableBlock::initWithTable_startingRow_rowSpan_startingColumn_columnSpan(
+                NSTextTableBlock::alloc(),
+                table,
+                row as isize,
+                1,
+                c as isize,
+                1,
+            );
+            block.setWidth_type_forLayer_edge(
+                1.0,
+                NSTextBlockValueType::AbsoluteValueType,
+                NSTextBlockLayer::Border,
+                NSRectEdge::MinX,
+            );
+            block.setWidth_type_forLayer_edge(
+                1.0,
+                NSTextBlockValueType::AbsoluteValueType,
+                NSTextBlockLayer::Border,
+                NSRectEdge::MinY,
+            );
+            block.setWidth_type_forLayer_edge(
+                if c + 1 == ncols { 1.0 } else { 0.0 },
+                NSTextBlockValueType::AbsoluteValueType,
+                NSTextBlockLayer::Border,
+                NSRectEdge::MaxX,
+            );
+            block.setWidth_type_forLayer_edge(
+                if is_last_row { 1.0 } else { 0.0 },
+                NSTextBlockValueType::AbsoluteValueType,
+                NSTextBlockLayer::Border,
+                NSRectEdge::MaxY,
+            );
+            block.setWidth_type_forLayer(
+                6.0,
+                NSTextBlockValueType::AbsoluteValueType,
+                NSTextBlockLayer::Padding,
+            );
+            block.setBorderColor(Some(&self.table_border_color));
+            if header {
+                block.setBackgroundColor(Some(&self.table_header_bg));
+            }
+
+            let pstyle = NSMutableParagraphStyle::new();
+            pstyle.setAlignment(ns_alignment(aligns[c]));
+            // Tight vertical rhythm inside cells.
+            pstyle.setParagraphSpacing(0.0);
+            pstyle.setParagraphSpacingBefore(0.0);
+            let super_block: Retained<NSTextBlock> = Retained::into_super(block);
+            let blocks_array = NSArray::from_retained_slice(&[super_block]);
+            pstyle.setTextBlocks(&blocks_array);
+
+            let base = if header {
+                BaseStyle::HeaderCell
+            } else {
+                BaseStyle::Body
+            };
+            self.render_inline(cell_text, &pstyle, base);
+            let trailing_font: &NSFont = if header { &self.bold_font } else { &self.body_font };
+            let trailing_attrs = attrs_for(&[
+                (unsafe { NSFontAttributeName }, trailing_font),
+                (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
+            ]);
+            self.append("\n", &trailing_attrs);
+        }
+    }
+
     fn emit_pre_block(&self, lines: &[&str]) {
         // One paragraph per line so a long block can wrap-or-not by
         // line. Spacing only on the last line for visual grouping.
@@ -401,6 +544,7 @@ impl Builder {
 enum BaseStyle {
     Body,
     QuoteItalic,
+    HeaderCell,
 }
 
 fn base_attrs(
@@ -417,6 +561,11 @@ fn base_attrs(
         BaseStyle::QuoteItalic => attrs_for(&[
             (unsafe { NSFontAttributeName }, &*b.italic_font),
             (unsafe { NSForegroundColorAttributeName }, &*b.secondary_color),
+            (unsafe { NSParagraphStyleAttributeName }, pstyle),
+        ]),
+        BaseStyle::HeaderCell => attrs_for(&[
+            (unsafe { NSFontAttributeName }, &*b.bold_font),
+            (unsafe { NSForegroundColorAttributeName }, &*b.text_color),
             (unsafe { NSParagraphStyleAttributeName }, pstyle),
         ]),
     }
@@ -440,11 +589,11 @@ fn bold_attrs(
     base: BaseStyle,
 ) -> Retained<NSDictionary<NSString>> {
     let font: &NSFont = match base {
-        BaseStyle::Body => &b.bold_font,
+        BaseStyle::Body | BaseStyle::HeaderCell => &b.bold_font,
         BaseStyle::QuoteItalic => &b.bold_italic_font,
     };
     let color: &NSColor = match base {
-        BaseStyle::Body => &b.text_color,
+        BaseStyle::Body | BaseStyle::HeaderCell => &b.text_color,
         BaseStyle::QuoteItalic => &b.secondary_color,
     };
     attrs_for(&[
@@ -462,9 +611,10 @@ fn italic_attrs(
     let font: &NSFont = match base {
         BaseStyle::Body => &b.italic_font,
         BaseStyle::QuoteItalic => &b.italic_font, // already italic; keep
+        BaseStyle::HeaderCell => &b.bold_italic_font,
     };
     let color: &NSColor = match base {
-        BaseStyle::Body => &b.text_color,
+        BaseStyle::Body | BaseStyle::HeaderCell => &b.text_color,
         BaseStyle::QuoteItalic => &b.secondary_color,
     };
     attrs_for(&[
@@ -525,6 +675,14 @@ fn paragraph_style(
 }
 
 // ----------------------------------------------------------------------
+
+fn ns_alignment(a: CellAlign) -> NSTextAlignment {
+    match a {
+        CellAlign::Left => NSTextAlignment::Left,
+        CellAlign::Center => NSTextAlignment::Center,
+        CellAlign::Right => NSTextAlignment::Right,
+    }
+}
 
 fn heading_font_size(level: u32) -> f64 {
     match level {

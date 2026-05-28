@@ -18,7 +18,7 @@ in its own app sharing the structural parser via `markdown-core`.
 - Bullet (`- item`) and numbered (`1. item`) lists
 - Blockquotes
 - [Clickable links](https://example.com) (open in the default browser)
-- Tables render as monospace pre blocks — no fancy column layout
+- GitHub-flavoured tables with per-column alignment
 
 ## Code
 
@@ -35,15 +35,16 @@ fn main() {
 
 ## Tables
 
-Tables are deliberately *not* laid out as real tables. They render
-exactly as written, in monospace, which works well for
-already-aligned source:
+Tables lay out as real columns using `NSTextTable`. The separator row
+controls per-column alignment: `:---` left, `---:` right, `:---:`
+centred. Inline marks like **bold**, *italic*, `code`, and
+[links](https://example.com) still apply inside cells.
 
-| left   | right   |
-| ------ | ------- |
-| alpha  | one     |
-| beta   | two     |
-| gamma  | three   |
+| Name   | Count | Notes                |
+| :----- | ----: | :------------------: |
+| alpha  |     1 | first **letter**     |
+| beta   |    20 | `greek`              |
+| gamma  |   300 | [link](https://x.y)  |
 
 ---
 

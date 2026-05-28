@@ -757,6 +757,116 @@ pub fn find_table_run(blocks: &[BlockLine], start_index: usize) -> Option<(usize
     Some((start_index, end))
 }
 
+/// Column alignment derived from the `| :--: |` separator row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Split a table row on `|`. Leading and trailing pipes (and surrounding
+/// whitespace) are stripped, and a backslash-escaped pipe (`\|`) is
+/// treated as a literal cell character rather than a separator.
+pub fn split_table_row(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut cells: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    // Skip leading whitespace.
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    // Skip a leading `|`.
+    let starts_with_pipe = i < bytes.len() && bytes[i] == b'|';
+    if starts_with_pipe {
+        i += 1;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && bytes.get(i + 1) == Some(&b'|') {
+            cur.push('|');
+            i += 2;
+            continue;
+        }
+        if b == b'|' {
+            cells.push(cur.trim().to_string());
+            cur = String::new();
+            i += 1;
+            continue;
+        }
+        if b == b'\r' {
+            i += 1;
+            continue;
+        }
+        // UTF-8 safe push: advance by char length.
+        let ch_len = utf8_char_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        cur.push_str(&line[i..end]);
+        i = end;
+    }
+    let trimmed = cur.trim();
+    // If the row ended on a trailing pipe, `cur` is just whitespace and
+    // we already pushed the real last cell; skip the empty trailing one.
+    if !(starts_with_pipe && trimmed.is_empty() && !cells.is_empty()) {
+        cells.push(trimmed.to_string());
+    }
+    cells
+}
+
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first < 0xC0 {
+        1 // continuation byte — shouldn't start a char, but be defensive
+    } else if first < 0xE0 {
+        2
+    } else if first < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Recognise a table-separator row like `| :--- | ---: | :---: |`.
+/// Returns the per-column alignments on success.
+pub fn parse_table_separator(line: &str) -> Option<Vec<CellAlign>> {
+    let cells = split_table_row(line);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let bytes = cell.as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        let left = bytes.first() == Some(&b':');
+        let right = bytes.last() == Some(&b':');
+        let start = if left { 1 } else { 0 };
+        let end = if right { bytes.len() - 1 } else { bytes.len() };
+        if end <= start {
+            return None;
+        }
+        let middle = &bytes[start..end];
+        if middle.is_empty() || !middle.iter().all(|&b| b == b'-') {
+            return None;
+        }
+        if middle.len() < 3 {
+            // Spec requires at least 3 dashes, but real-world tables
+            // often use just two. Accept >=1 to match GFM in practice.
+            // (Still reject 0, handled above.)
+        }
+        let align = match (left, right) {
+            (true, true) => CellAlign::Center,
+            (false, true) => CellAlign::Right,
+            _ => CellAlign::Left,
+        };
+        out.push(align);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +1050,44 @@ mod tests {
         assert_eq!(find_table_run(&out.blocks, 0), None);
         assert_eq!(find_table_run(&out.blocks, 1), Some((1, 3)));
         assert_eq!(find_table_run(&out.blocks, 3), None);
+    }
+
+    #[test]
+    fn split_table_row_basic() {
+        assert_eq!(split_table_row("| a | b | c |"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_table_row_no_outer_pipes() {
+        assert_eq!(split_table_row("a | b | c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_table_row_escaped_pipe() {
+        assert_eq!(split_table_row("| a\\|b | c |"), vec!["a|b", "c"]);
+    }
+
+    #[test]
+    fn split_table_row_trims_whitespace() {
+        assert_eq!(split_table_row("|   x   |  y  |"), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn parse_separator_all_alignments() {
+        assert_eq!(
+            parse_table_separator("| :--- | ---: | :---: | --- |"),
+            Some(vec![
+                CellAlign::Left,
+                CellAlign::Right,
+                CellAlign::Center,
+                CellAlign::Left,
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_separator_rejects_non_separator() {
+        assert_eq!(parse_table_separator("| header | row |"), None);
+        assert_eq!(parse_table_separator("| :no | --- |"), None);
     }
 }

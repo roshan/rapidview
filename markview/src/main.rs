@@ -17,16 +17,17 @@ use doc::Document;
 use markdown_core::ProgressSink;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSColor,
     NSEventModifierFlags, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
-    NSLayoutConstraint, NSLayoutConstraintOrientation, NSLineBreakMode, NSMenu, NSMenuItem,
-    NSModalResponse, NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSScrollView, NSStackView, NSStackViewDistribution,
-    NSTextField, NSTextView, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode,
+    NSLayoutConstraint, NSLayoutConstraintOrientation, NSLayoutManager, NSLineBreakMode,
+    NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSPasteboard, NSPasteboardTypeString,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSStackView,
+    NSStackViewDistribution, NSTextContainer, NSTextField, NSTextStorage, NSTextView,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTabbingMode,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol,
@@ -418,7 +419,22 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
 fn build_text_view(mtm: MainThreadMarker, scroll: &NSScrollView) -> Retained<NSTextView> {
     let content_size = scroll.contentSize();
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), content_size);
-    let tv = NSTextView::initWithFrame(NSTextView::alloc(mtm), frame);
+    // Construct an explicit TextKit 1 stack so NSTextTable lays tables
+    // out as real columns. TextKit 2 (the default on modern macOS for
+    // initWithFrame:) does not honour NSTextBlock-based table layout.
+    let storage = NSTextStorage::new();
+    let layout_manager = NSLayoutManager::new();
+    let container = NSTextContainer::initWithSize(
+        NSTextContainer::alloc(),
+        NSSize::new(content_size.width, f64::MAX),
+    );
+    storage.addLayoutManager(&layout_manager);
+    layout_manager.addTextContainer(&container);
+    let tv = NSTextView::initWithFrame_textContainer(
+        NSTextView::alloc(mtm),
+        frame,
+        Some(&container),
+    );
     tv.setMinSize(NSSize::new(0.0, content_size.height));
     tv.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
     tv.setVerticallyResizable(true);
