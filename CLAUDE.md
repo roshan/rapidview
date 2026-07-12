@@ -13,10 +13,11 @@ src/format/mod.rs    shared types + dispatch (Format, ParseOutput, PathSegment,
 src/format/json.rs   JSON tokenizer + jq path formatter + prettifier
 src/format/xml.rs    XML tokenizer + XPath formatter + two-pass prettifier
                      (classify each element as block-or-mixed, then emit)
-src/format/csv.rs    CSV/TSV tokenizer + xsv path formatter + table-layout
-                     metadata (CsvMeta: per-column widths/origins) + the
-                     draw-time helpers DocView uses (record_cells,
-                     visual_col_of_byte, byte_of_visual_col, render_row)
+src/format/csv.rs    CSV/TSV incremental Indexer + xsv path formatter +
+                     table-layout metadata (CsvMeta: per-column widths/
+                     origins/selects) + the on-demand helpers DocView uses
+                     (scan_cells, locate, visual_col_of_byte,
+                     byte_of_visual_col, render_row)
 src/doc.rs           Document = bytes + format + ParseOutput + max_line_bytes.
                      ByteSource is Arc<Mmap> for files, Arc<[u8]> for clipboard
                      and prettify output.
@@ -35,12 +36,14 @@ markview/            Separate binary crate — Markview app. NSTextView-based
 
 The renderer is format-agnostic — `ParseOutput` is identical between JSON and XML. Anything format-specific (path expression, sub-tree extraction, pretty-printer) dispatches on `Format` at the call site, e.g. `format::path_expression(doc.format, ...)`. The one exception is CSV: `ParseOutput.csv` carries table-layout metadata, and `DocView` renders CSV as an aligned table computed **at draw time** — fields drawn at column origins, capped at 64 chars with a visual-only `…` (the mmapped bytes are never copied or padded, so Copy always yields the full field). `line_starts` for CSV are *record* starts; embedded newlines in quoted fields render as `␤` via `csv::display_char` in both table and raw mode.
 
+CSV keeps **no per-cell index** (RAPIDVIEW-2): the only per-row state is `line_starts` (4 B/record). Cell ranges, click→cell resolution, and copy ranges are re-derived per record on demand (`csv::scan_cells` / `csv::locate` — a frame only needs the ~60 visible rows), so CSV clicks never go through `PathIndex`. Column widths come from the first 16 MB (`WIDTH_SAMPLE_BYTES`), then the indexer freezes layout and degrades to a fast record-boundary scan (~1.5 GB/s). Large CSVs load **progressively**: the worker publishes a browsable `DocumentProgress` snapshot every 256 MB scanned, then a final `DocumentReady` that swaps in without resetting scroll/click/search (`WindowState.progressive_path` marks the continuation).
+
 ## Critical conventions
 
 - `#![deny(unsafe_op_in_unsafe_fn)]` at the crate root. Cocoa calls go inside explicit `unsafe { ... }` blocks.
 - objc2 `define_class!` for AppKit subclasses (`RVAppDelegate`, `RVDocView`).
 - Per-tab state lives in `app_state::WINDOWS: HashMap<WindowId, WindowState>`. `WindowId` is the raw `NSWindow` pointer reinterpreted as `usize` — stable for the window's lifetime, never dereferenced.
-- One worker thread per request. Worker emits `ParseStarted` first (carrying `Arc<ProgressSink>`), then exactly one terminal message: `DocumentReady`, `PrettyReady`, or `Error`. `WORK_PENDING` only decrements on terminal messages; the poll timer tears down when it hits zero.
+- One worker thread per request. Worker emits `ParseStarted` first (carrying `Arc<ProgressSink>`), then exactly one terminal message: `DocumentReady`, `PrettyReady`, or `Error`. Large CSVs additionally emit non-terminal `DocumentProgress` snapshots in between. `WORK_PENDING` only decrements on terminal messages; the poll timer tears down when it hits zero.
 - Format auto-detection: `format::detect` looks at the first non-whitespace byte after a possible UTF-8 BOM. `<` → XML, else JSON. CSV/TSV are picked by **file extension only** (`detect_for_path`: `.csv` / `.tsv` / `.tab`) — never by content sniffing, so clipboard pastes can't become CSV (deliberate, per Roshan).
 - For CSV docs the Prettify button is a Table ↔ Original toggle (`DocView::set_csv_table_mode`) — a draw-flag flip, no worker round-trip, no second `Document`. `format::prettify` is never invoked for CSV.
 

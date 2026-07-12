@@ -1,26 +1,33 @@
-//! CSV/TSV tokenizer + xsv-style path formatter + table-layout metadata.
+//! CSV/TSV indexer + xsv path formatter + table-layout metadata.
 //!
 //! Unlike JSON/XML, CSV renders as an aligned table computed at *draw*
-//! time: the parser records per-column content widths (capped at
-//! `MAX_COL_CHARS`) and per-cell byte ranges (ordinary `PathEntry`s),
-//! and `DocView` lays each field out at its column origin when
-//! painting. The raw bytes are never copied or padded — the document
-//! stays mmapped, and truncation past the column cap is visual only,
-//! so Copy always yields the full field.
+//! time, and — since RAPIDVIEW-2 — keeps **no per-cell index**. The
+//! indexer records only record starts (`line_starts`, 4 B/row) and
+//! per-column display widths; everything cell-shaped (field ranges for
+//! drawing, click→cell resolution, copy ranges) is re-derived on
+//! demand by rescanning the one record involved (`scan_cells`,
+//! `locate`). Records are short, and a frame only ever needs the ~60
+//! visible rows, so the rescan is noise — while the index for a
+//! multi-GB file shrinks from gigabytes to megabytes.
+//!
+//! Column widths come from the first `WIDTH_SAMPLE_BYTES` of the file;
+//! after that the indexer freezes the layout and degrades to a fast
+//! record-boundary scan. The 64-char cap means a sample that large is
+//! effectively always representative.
 //!
 //! One record per display line: `line_starts` holds *record* starts,
 //! so a quoted field with an embedded newline does not split its row.
-//! Embedded control characters are substituted with picture glyphs at
-//! draw time (`display_char`), one char per byte, which keeps the
-//! parser's width accounting and the renderer's layout in agreement.
+//! Embedded control characters render as picture glyphs
+//! (`display_char`), one char per byte, which keeps width accounting
+//! and layout in agreement.
 //!
 //! The first record is always treated as a header row. Duplicate or
 //! empty header names fall back to 1-based positional selectors, which
 //! is also what `xsv select` needs to address them unambiguously.
 
 use super::{
-    NameInterner, Offset, PROGRESS_GRANULARITY, ParseOutput, PathEntry, PathIndex, PathSegment,
-    ProgressSink, ROOT_PARENT, StyleKind,
+    Offset, PROGRESS_GRANULARITY, ParseOutput, PathEntry, PathIndex, PathSegment, ProgressSink,
+    ROOT_PARENT, StyleKind,
 };
 use std::sync::atomic::Ordering;
 
@@ -29,18 +36,29 @@ use std::sync::atomic::Ordering;
 pub const MAX_COL_CHARS: u32 = 64;
 /// Blank chars between columns.
 pub const GUTTER_CHARS: u32 = 2;
+/// Column widths are computed from this prefix of the file, then
+/// frozen so indexing the remainder is a pure record-boundary scan and
+/// the layout never shifts under the user during a progressive load.
+pub const WIDTH_SAMPLE_BYTES: usize = 16 << 20;
 
-/// Table layout computed by the parser: per-column display widths and
-/// the char offset each column starts at. Everything is in character
-/// columns (× the view's monospace advance = pixels).
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// Table layout computed by the indexer: per-column display widths,
+/// the char offset each column starts at, and ready-to-emit `xsv
+/// select` names. Everything is in character columns (× the view's
+/// monospace advance = pixels).
 #[derive(Debug)]
 pub struct CsvMeta {
-    /// Per-column display width in chars: max content width, capped.
+    pub delimiter: u8,
+    /// Per-column display width in chars: max sampled content width, capped.
     pub col_widths: Vec<u32>,
     /// Char column each column starts at (prefix sums incl. gutters).
     pub col_origins: Vec<u32>,
     /// Total table width in chars.
     pub table_width: u32,
+    /// `xsv select` selector per column — quoted header name, or a
+    /// 1-based position for duplicate/empty/missing headers.
+    pub col_selects: Vec<String>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -50,47 +68,129 @@ enum Term {
     Eof,
 }
 
-struct Parser<'a> {
+/// Advance over one field starting at `pos`. Returns the byte offset
+/// of the terminator (delimiter / unquoted newline / EOF) and which it
+/// was. Quoted fields ("" = escaped quote) may contain delimiters and
+/// newlines; an unterminated quote runs to EOF.
+#[inline]
+fn scan_one_field(bytes: &[u8], mut pos: usize, delimiter: u8) -> (usize, Term) {
+    let n = bytes.len();
+    if pos < n && bytes[pos] == b'"' {
+        pos += 1;
+        while pos < n {
+            if bytes[pos] == b'"' {
+                if pos + 1 < n && bytes[pos + 1] == b'"' {
+                    pos += 2;
+                } else {
+                    pos += 1;
+                    break;
+                }
+            } else {
+                pos += 1;
+            }
+        }
+    }
+    // Unquoted remainder (the whole field when it didn't start with a
+    // quote; trailing junk after a closing quote otherwise).
+    while pos < n {
+        let b = bytes[pos];
+        if b == delimiter {
+            return (pos, Term::Delim);
+        }
+        if b == b'\n' {
+            return (pos, Term::Newline);
+        }
+        pos += 1;
+    }
+    (pos, Term::Eof)
+}
+
+/// Strip the `\r` of a `\r\n` line ending off a field's content range.
+#[inline]
+fn strip_cr(bytes: &[u8], start: usize, end: usize, term: Term) -> usize {
+    if term != Term::Delim && end > start && bytes[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    }
+}
+
+/// Incremental CSV indexer. `scan` consumes input in budgeted slices
+/// (always stopping on a record boundary) so the worker can publish
+/// browsable snapshots of a huge file while the tail is still being
+/// indexed; `parse` below drives it to completion in one call.
+pub struct Indexer<'a> {
     input: &'a [u8],
     delimiter: u8,
     pos: usize,
     line_starts: Vec<Offset>,
-    paths: Vec<PathEntry>,
-    names: NameInterner,
-    /// Interned select-name id per column (header name, or 1-based
-    /// position for duplicate/empty/missing headers).
-    col_keys: Vec<u32>,
-    /// Max content chars seen per column (uncapped).
+    /// Max content chars seen per column (uncapped) — sample only.
     col_chars: Vec<u32>,
+    col_selects: Vec<String>,
+    header_done: bool,
+    widths_frozen: bool,
+    sample_limit: usize,
     scratch: Vec<u8>,
     progress: Option<&'a ProgressSink>,
     next_progress_at: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn new(input: &'a [u8], delimiter: u8, progress: Option<&'a ProgressSink>) -> Self {
+impl<'a> Indexer<'a> {
+    pub fn new(input: &'a [u8], delimiter: u8, progress: Option<&'a ProgressSink>) -> Self {
         let next_progress_at = if progress.is_some() {
             PROGRESS_GRANULARITY
         } else {
             usize::MAX
         };
+        let mut pos = 0;
+        if input.starts_with(BOM) {
+            pos = 3;
+        }
         Self {
             input,
             delimiter,
-            pos: 0,
+            pos,
             line_starts: vec![0],
-            paths: Vec::new(),
-            names: NameInterner::default(),
-            col_keys: Vec::new(),
             col_chars: Vec::new(),
+            col_selects: Vec::new(),
+            header_done: false,
+            widths_frozen: false,
+            sample_limit: WIDTH_SAMPLE_BYTES,
             scratch: Vec::with_capacity(64),
             progress,
             next_progress_at,
         }
     }
 
+    /// Shrink the width sample (tests only — the default is 16 MB).
+    #[cfg(test)]
+    pub fn with_sample_limit(mut self, limit: usize) -> Self {
+        self.sample_limit = limit;
+        self
+    }
+
+    /// Index up to `budget` more bytes, stopping on a record boundary.
+    /// Returns true once the whole input has been consumed.
+    pub fn scan(&mut self, budget: usize) -> bool {
+        let target = self.pos.saturating_add(budget);
+        while self.pos < self.input.len() && self.pos < target {
+            if self.pos >= self.next_progress_at {
+                self.flush_progress();
+            }
+            if self.widths_frozen {
+                self.skip_record();
+            } else {
+                self.index_record();
+                if !self.widths_frozen && self.pos >= self.sample_limit {
+                    self.widths_frozen = true;
+                }
+            }
+        }
+        self.pos >= self.input.len()
+    }
+
     /// Cold path: publish current `pos` to the progress sink and bump
-    /// the next threshold. `#[cold]` keeps the per-field path tight.
+    /// the next threshold. `#[cold]` keeps the per-record path tight.
     #[cold]
     #[inline(never)]
     fn flush_progress(&mut self) {
@@ -100,160 +200,93 @@ impl<'a> Parser<'a> {
         self.next_progress_at = self.pos + PROGRESS_GRANULARITY;
     }
 
-    fn parse_document(&mut self) {
-        // Root spans the whole input so a click anywhere resolves.
-        self.paths.push(PathEntry {
-            start: 0,
-            end: self.input.len() as u32,
-            parent: ROOT_PARENT,
-            segment: PathSegment::Root,
-        });
-        if self.input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.pos = 3;
-        }
-        let mut record: u32 = 0;
-        while self.pos < self.input.len() {
-            self.parse_record(record);
-            record += 1;
-        }
-    }
-
-    fn parse_record(&mut self, record: u32) {
-        let record_start = self.pos as u32;
-        // Data rows get a PathEntry so a click in the gutter still
-        // resolves to `xsv slice -i N`. The header row's parent is the
-        // root directly.
-        let row_idx = if record > 0 {
-            let idx = self.paths.len() as u32;
-            self.paths.push(PathEntry {
-                start: record_start,
-                end: record_start,
-                parent: 0,
-                segment: PathSegment::Index(record - 1),
-            });
-            Some(idx)
-        } else {
-            None
-        };
-
+    /// Sample-phase record walk: exact field scan, width + header
+    /// accounting per field.
+    fn index_record(&mut self) {
+        let is_header = !self.header_done;
         let mut col = 0usize;
-        let mut record_end;
         loop {
-            if self.pos >= self.next_progress_at {
-                self.flush_progress();
+            let start = self.pos;
+            let (stop, term) = scan_one_field(self.input, self.pos, self.delimiter);
+            let end = strip_cr(self.input, start, stop, term);
+
+            let chars = char_count(&self.input[start..end]);
+            if col >= self.col_chars.len() {
+                self.col_chars.push(0);
             }
-            let field_start = self.pos;
-            let (mut field_end, term) = self.scan_field();
-            // Strip the \r of a \r\n line ending off the last field.
-            if term != Term::Delim
-                && field_end > field_start
-                && self.input[field_end - 1] == b'\r'
-            {
-                field_end -= 1;
+            if chars > self.col_chars[col] {
+                self.col_chars[col] = chars;
             }
-            self.note_field(record, row_idx, col, field_start as u32, field_end as u32);
-            record_end = field_end as u32;
+            if is_header {
+                self.note_header_name(start, end);
+            } else {
+                while self.col_selects.len() <= col {
+                    self.col_selects.push((self.col_selects.len() + 1).to_string());
+                }
+            }
+
             col += 1;
             match term {
-                Term::Delim => self.pos += 1,
+                Term::Delim => self.pos = stop + 1,
                 Term::Newline => {
-                    self.pos += 1;
+                    self.pos = stop + 1;
                     self.line_starts.push(self.pos as u32);
                     break;
                 }
-                Term::Eof => break,
-            }
-        }
-        if let Some(idx) = row_idx {
-            self.paths[idx as usize].end = record_end;
-        }
-    }
-
-    /// Consume one field starting at `self.pos`, leaving `pos` on the
-    /// terminator (delimiter / newline) or at EOF. Returns the byte
-    /// offset one past the field's raw content and what ended it.
-    /// Quoted fields ("" = escaped quote) may contain delimiters and
-    /// newlines; an unterminated quote runs to EOF.
-    fn scan_field(&mut self) -> (usize, Term) {
-        let input = self.input;
-        let n = input.len();
-        if self.pos < n && input[self.pos] == b'"' {
-            self.pos += 1;
-            while self.pos < n {
-                if input[self.pos] == b'"' {
-                    if self.pos + 1 < n && input[self.pos + 1] == b'"' {
-                        self.pos += 2;
-                    } else {
-                        self.pos += 1;
-                        break;
-                    }
-                } else {
-                    self.pos += 1;
+                Term::Eof => {
+                    self.pos = stop;
+                    break;
                 }
             }
         }
-        // Unquoted remainder (the whole field when it didn't start with
-        // a quote; trailing junk after a closing quote otherwise).
+        if is_header {
+            self.header_done = true;
+        }
+    }
+
+    /// Post-freeze fast path: find the next record boundary and nothing
+    /// else. The bare quote toggle matches the field-aware scan on any
+    /// RFC-quoted input ("" toggles twice = no net change); it can only
+    /// disagree on pathological bare quotes mid-field, where a slightly
+    /// misplaced row boundary is an acceptable trade for scan speed.
+    fn skip_record(&mut self) {
+        let bytes = self.input;
+        let n = bytes.len();
+        let mut in_quotes = false;
         while self.pos < n {
-            let b = input[self.pos];
-            if b == self.delimiter {
-                return (self.pos, Term::Delim);
-            }
-            if b == b'\n' {
-                return (self.pos, Term::Newline);
+            match bytes[self.pos] {
+                b'"' => in_quotes = !in_quotes,
+                b'\n' if !in_quotes => {
+                    self.pos += 1;
+                    self.line_starts.push(self.pos as u32);
+                    return;
+                }
+                _ => {}
             }
             self.pos += 1;
         }
-        (self.pos, Term::Eof)
     }
 
-    fn note_field(&mut self, record: u32, row_idx: Option<u32>, col: usize, start: u32, end: u32) {
-        let chars = char_count(&self.input[start as usize..end as usize]);
-        if col >= self.col_chars.len() {
-            self.col_chars.push(0);
-        }
-        if chars > self.col_chars[col] {
-            self.col_chars[col] = chars;
-        }
-
-        if record == 0 {
-            decode_field(&self.input[start as usize..end as usize], &mut self.scratch);
-            let key = if self.scratch.is_empty() {
-                self.names.intern(format!("{}", col + 1).as_bytes())
-            } else {
-                let id = self.names.intern(&self.scratch);
-                if self.col_keys.contains(&id) {
-                    // Duplicate header — xsv resolves the name to the
-                    // first occurrence, so later ones go positional.
-                    self.names.intern(format!("{}", col + 1).as_bytes())
-                } else {
-                    id
-                }
-            };
-            self.col_keys.push(key);
-            self.paths.push(PathEntry {
-                start,
-                end,
-                parent: 0,
-                segment: PathSegment::Key(key),
-            });
+    fn note_header_name(&mut self, start: usize, end: usize) {
+        decode_field(&self.input[start..end], &mut self.scratch);
+        let col = self.col_selects.len();
+        let positional = (col + 1).to_string();
+        let select = if self.scratch.is_empty() {
+            positional
         } else {
-            while self.col_keys.len() <= col {
-                let key = self
-                    .names
-                    .intern(format!("{}", self.col_keys.len() + 1).as_bytes());
-                self.col_keys.push(key);
+            let name = select_name(&self.scratch);
+            if self.col_selects.contains(&name) {
+                // Duplicate header — xsv resolves the name to the
+                // first occurrence, so later ones go positional.
+                positional
+            } else {
+                name
             }
-            self.paths.push(PathEntry {
-                start,
-                end,
-                parent: row_idx.expect("data rows always have a row entry"),
-                segment: PathSegment::Key(self.col_keys[col]),
-            });
-        }
+        };
+        self.col_selects.push(select);
     }
 
-    fn finish(self) -> ParseOutput {
+    fn build_meta(&self) -> CsvMeta {
         let col_widths: Vec<u32> = self
             .col_chars
             .iter()
@@ -265,30 +298,61 @@ impl<'a> Parser<'a> {
             col_origins.push(acc);
             acc += w + GUTTER_CHARS;
         }
-        let table_width = acc.saturating_sub(GUTTER_CHARS);
+        CsvMeta {
+            delimiter: self.delimiter,
+            table_width: acc.saturating_sub(GUTTER_CHARS),
+            col_widths,
+            col_origins,
+            col_selects: self.col_selects.clone(),
+        }
+    }
+
+    fn build_output(&self, line_starts: Vec<Offset>) -> ParseOutput {
         ParseOutput {
-            line_starts: self.line_starts,
+            line_starts,
             paths: PathIndex {
-                entries: self.paths,
+                // Root only — cells are re-derived on demand, clicks
+                // resolve through `locate`, never through PathIndex.
+                entries: vec![PathEntry {
+                    start: 0,
+                    end: self.input.len() as u32,
+                    parent: ROOT_PARENT,
+                    segment: PathSegment::Root,
+                }],
             },
-            // Colors are computed at draw time from the cell entries
-            // (header row / numeric fields), so no spans — this keeps
-            // index memory at one PathEntry per cell.
             styles: Vec::new(),
-            names: self.names,
+            names: Default::default(),
             error: None,
             bytes: self.input.len(),
-            csv: Some(CsvMeta {
-                col_widths,
-                col_origins,
-                table_width,
-            }),
+            csv: Some(self.build_meta()),
         }
+    }
+
+    /// Browsable snapshot of everything indexed so far. Clones the
+    /// record-start vector — cheap relative to the scan itself.
+    pub fn snapshot(&self) -> ParseOutput {
+        self.build_output(self.line_starts.clone())
+    }
+
+    /// Final output; consumes the indexer, no clone.
+    pub fn into_output(mut self) -> ParseOutput {
+        if let Some(sink) = self.progress {
+            sink.bytes_done
+                .store(self.input.len() as u64, Ordering::Relaxed);
+        }
+        let line_starts = std::mem::take(&mut self.line_starts);
+        self.build_output(line_starts)
     }
 }
 
-/// Unquote a field for interning: strip surrounding quotes, collapse
-/// `""` escapes. Unquoted fields copy through as-is.
+pub fn parse(input: &[u8], delimiter: u8, progress: Option<&ProgressSink>) -> ParseOutput {
+    let mut ix = Indexer::new(input, delimiter, progress);
+    while !ix.scan(usize::MAX) {}
+    ix.into_output()
+}
+
+/// Unquote a field: strip surrounding quotes, collapse `""` escapes.
+/// Unquoted fields copy through as-is.
 fn decode_field(raw: &[u8], out: &mut Vec<u8>) {
     out.clear();
     if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
@@ -308,13 +372,107 @@ fn decode_field(raw: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-pub fn parse(input: &[u8], delimiter: u8, progress: Option<&ProgressSink>) -> ParseOutput {
-    let mut p = Parser::new(input, delimiter, progress);
-    p.parse_document();
-    if let Some(sink) = progress {
-        sink.bytes_done.store(input.len() as u64, Ordering::Relaxed);
+/// Quote a column name for `xsv select` unless it's a bare identifier
+/// or a positional index.
+fn select_name(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let all_digits = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let identifier = s
+        .chars()
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if all_digits || identifier {
+        s.into_owned()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
     }
-    p.finish()
+}
+
+// --- on-demand record access (draw / click / copy) ---------------------
+
+/// Field byte ranges of the record starting at `start` (a `line_starts`
+/// entry), in column order. Rescans the record's bytes — the only
+/// per-cell state the document keeps is this function's input.
+pub fn scan_cells(bytes: &[u8], start: u32, delimiter: u8) -> Vec<(u32, u32)> {
+    let mut pos = start as usize;
+    if pos == 0 && bytes.starts_with(BOM) {
+        pos = 3;
+    }
+    if pos >= bytes.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    loop {
+        let s = pos;
+        let (stop, term) = scan_one_field(bytes, pos, delimiter);
+        let e = strip_cr(bytes, s, stop, term);
+        out.push((s as u32, e as u32));
+        match term {
+            Term::Delim => pos = stop + 1,
+            Term::Newline | Term::Eof => break,
+        }
+    }
+    out
+}
+
+/// What a byte offset points at: the record, and the cell when the
+/// offset lands inside one (delimiters/gutters resolve to row-only).
+pub struct Hit {
+    /// 0-based data-row index; None on the header record.
+    pub data_row: Option<u32>,
+    pub col: Option<usize>,
+    pub cell: Option<(u32, u32)>,
+    /// Record content range (trailing newline / `\r` excluded).
+    pub record: (u32, u32),
+}
+
+/// Resolve `offset` to its record and (maybe) cell by rescanning the
+/// one record that contains it.
+pub fn locate(bytes: &[u8], line_starts: &[u32], delimiter: u8, offset: u32) -> Hit {
+    let line = line_starts
+        .partition_point(|&s| s <= offset)
+        .saturating_sub(1);
+    let start = line_starts.get(line).copied().unwrap_or(0);
+    let cells = scan_cells(bytes, start, delimiter);
+    let record_end = cells.last().map(|c| c.1).unwrap_or(start);
+    let mut col = None;
+    let mut cell = None;
+    for (i, &(s, e)) in cells.iter().enumerate() {
+        if offset >= s && offset < e {
+            col = Some(i);
+            cell = Some((s, e));
+            break;
+        }
+    }
+    Hit {
+        data_row: if line == 0 { None } else { Some(line as u32 - 1) },
+        col,
+        cell,
+        record: (start, record_end),
+    }
+}
+
+/// xsv pipeline for a hit: cell → `xsv slice -i R | xsv select C`,
+/// row → `xsv slice -i R`, header cell → `xsv select C`, header
+/// gutter / nothing → `xsv table`.
+pub fn expression_for(meta: &CsvMeta, hit: &Hit) -> String {
+    let mut parts = Vec::new();
+    if let Some(r) = hit.data_row {
+        parts.push(format!("xsv slice -i {}", r));
+    }
+    if let Some(c) = hit.col {
+        let select = meta
+            .col_selects
+            .get(c)
+            .cloned()
+            .unwrap_or_else(|| (c + 1).to_string());
+        parts.push(format!("xsv select {}", select));
+    }
+    if parts.is_empty() {
+        return "xsv table".to_string();
+    }
+    parts.join(" | ")
 }
 
 // --- layout helpers (used by DocView at draw time) --------------------
@@ -340,23 +498,6 @@ fn byte_of_char(bytes: &[u8], n: u32) -> u32 {
     bytes.len() as u32
 }
 
-/// Absolute byte ranges of the cells of the record starting at
-/// `record_start`, in column order. `next_start` is the following
-/// record's start offset, or `u32::MAX` for the last record.
-pub fn record_cells(entries: &[PathEntry], record_start: u32, next_start: u32) -> Vec<(u32, u32)> {
-    let lo = entries.partition_point(|e| e.start < record_start);
-    let mut out = Vec::new();
-    for e in &entries[lo..] {
-        if e.start >= next_start {
-            break;
-        }
-        if matches!(e.segment, PathSegment::Key(_)) {
-            out.push((e.start, e.end));
-        }
-    }
-    out
-}
-
 /// Visual char column at which absolute `byte` renders on its row.
 /// Bytes inside a cell map to origin + chars-into-field (clamped to
 /// the column width); delimiter/gutter bytes collapse to the end of
@@ -377,8 +518,8 @@ pub fn visual_col_of_byte(meta: &CsvMeta, cells: &[(u32, u32)], bytes: &[u8], by
 }
 
 /// Absolute byte offset for a click at visual char column `col`.
-/// Clicks in a gutter clamp to the end of the preceding cell (so path
-/// lookup resolves to the row); clicks past a row's last cell clamp to
+/// Clicks in a gutter clamp to the end of the preceding cell (so the
+/// hit resolves to the row); clicks past a row's last cell clamp to
 /// its end. Returns `None` when the record has no cells.
 pub fn byte_of_visual_col(
     meta: &CsvMeta,
@@ -545,54 +686,20 @@ pub fn looks_numeric(field: &[u8]) -> bool {
     digits
 }
 
-// --- path expression ---------------------------------------------------
+// --- format-dispatch fallbacks ------------------------------------------
 
-/// Render a path as an xsv pipeline: cell → `xsv slice -i R | xsv
-/// select C`, row → `xsv slice -i R`, header cell → `xsv select C`,
-/// root → `xsv table` (the whole-document view).
-pub fn path_expression(segments: &[PathSegment], names: &NameInterner) -> String {
-    let mut row: Option<u32> = None;
-    let mut col: Option<u32> = None;
-    for seg in segments {
-        match seg {
-            PathSegment::Index(i) => row = Some(*i),
-            PathSegment::Key(k) => col = Some(*k),
-            _ => {}
-        }
-    }
-    let mut parts = Vec::new();
-    if let Some(r) = row {
-        parts.push(format!("xsv slice -i {}", r));
-    }
-    if let Some(c) = col {
-        parts.push(format!("xsv select {}", select_name(names.get(c))));
-    }
-    if parts.is_empty() {
-        return "xsv table".to_string();
-    }
-    parts.join(" | ")
+/// CSV paths never round-trip through `PathIndex` (only the root entry
+/// exists) — clicks resolve via `locate`/`expression_for`. This exists
+/// to keep the `format::path_expression` dispatch total.
+pub fn path_expression(
+    _segments: &[PathSegment],
+    _names: &super::NameInterner,
+) -> String {
+    "xsv table".to_string()
 }
 
-/// Quote a column name for `xsv select` unless it's a bare identifier
-/// or a positional index.
-fn select_name(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let all_digits = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    let identifier = s
-        .chars()
-        .next()
-        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if all_digits || identifier {
-        s.into_owned()
-    } else {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    }
-}
-
-/// Raw bytes covered by `entry` — the exact CSV fragment: field bytes
-/// (including any quoting) for a cell, the record for a row, the whole
-/// input for the root.
+/// Raw bytes covered by `entry` — only the root entry exists for CSV,
+/// so this is the whole input (used by whole-document copy).
 pub fn value_bytes_for_entry<'a>(bytes: &'a [u8], entry: &PathEntry) -> &'a [u8] {
     let start = (entry.start as usize).min(bytes.len());
     let end = (entry.end as usize).min(bytes.len());
@@ -610,10 +717,10 @@ mod tests {
         parse(src, b',', None)
     }
 
-    fn expr_at(out: &ParseOutput, offset: u32) -> String {
-        let entry = out.paths.lookup(offset).unwrap();
-        let path = out.paths.path_of(entry);
-        path_expression(&path, &out.names)
+    fn expr_at(src: &[u8], out: &ParseOutput, offset: u32) -> String {
+        let meta = out.csv.as_ref().unwrap();
+        let hit = locate(src, &out.line_starts, meta.delimiter, offset);
+        expression_for(meta, &hit)
     }
 
     const SIMPLE: &[u8] = b"name,age,city\nalice,30,sf\nbob,7,\"new york, ny\"\n";
@@ -626,11 +733,16 @@ mod tests {
     }
 
     #[test]
+    fn index_is_root_only() {
+        let out = parse_csv(SIMPLE);
+        assert_eq!(out.paths.entries.len(), 1);
+        assert!(matches!(out.paths.entries[0].segment, PathSegment::Root));
+    }
+
+    #[test]
     fn quoted_newline_does_not_split_record() {
         let src = b"a,b\n1,\"x\ny\"\n2,z\n";
         let out = parse_csv(src);
-        // Header, row with embedded newline, row "2,z" — 3 records
-        // (+ the phantom line after the trailing newline).
         assert_eq!(out.line_starts, vec![0, 4, 12, 16]);
     }
 
@@ -638,7 +750,6 @@ mod tests {
     fn widths_are_content_max_capped() {
         let out = parse_csv(SIMPLE);
         let meta = out.csv.as_ref().unwrap();
-        // name/alice/bob → 5; age/30/7 → 3; city/sf/"new york, ny" → 14.
         assert_eq!(meta.col_widths, vec![5, 3, 14]);
         assert_eq!(meta.col_origins, vec![0, 7, 12]);
         assert_eq!(meta.table_width, 26);
@@ -653,23 +764,29 @@ mod tests {
     fn cell_path_is_slice_and_select() {
         let out = parse_csv(SIMPLE);
         let pos = SIMPLE.windows(2).position(|w| w == b"sf").unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select city");
+        assert_eq!(expr_at(SIMPLE, &out, pos), "xsv slice -i 0 | xsv select city");
     }
 
     #[test]
     fn header_cell_path_is_select() {
         let out = parse_csv(SIMPLE);
-        assert_eq!(expr_at(&out, 0), "xsv select name");
+        assert_eq!(expr_at(SIMPLE, &out, 0), "xsv select name");
     }
 
     #[test]
     fn gutter_click_resolves_to_row() {
         let out = parse_csv(SIMPLE);
         // Offset of the comma after "alice" — the delimiter belongs to
-        // no cell, so lookup walks up to the row ("alice" is the first
-        // data row → index 0).
+        // no cell, so the hit is row-only ("alice" is data row 0).
         let comma = 14 + 5;
-        assert_eq!(expr_at(&out, comma), "xsv slice -i 0");
+        assert_eq!(expr_at(SIMPLE, &out, comma), "xsv slice -i 0");
+    }
+
+    #[test]
+    fn header_gutter_resolves_to_table() {
+        let out = parse_csv(SIMPLE);
+        // The comma after "name" on the header row.
+        assert_eq!(expr_at(SIMPLE, &out, 4), "xsv table");
     }
 
     #[test]
@@ -677,9 +794,9 @@ mod tests {
         let src = b"first name,\"a,b\"\nx,y\n";
         let out = parse_csv(src);
         let pos = src.iter().position(|&b| b == b'x').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select \"first name\"");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select \"first name\"");
         let pos = src.iter().position(|&b| b == b'y').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select \"a,b\"");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select \"a,b\"");
     }
 
     #[test]
@@ -687,11 +804,11 @@ mod tests {
         let src = b"a,a,\n1,2,3\n";
         let out = parse_csv(src);
         let pos = src.iter().position(|&b| b == b'1').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select a");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select a");
         let pos = src.iter().position(|&b| b == b'2').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select 2");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select 2");
         let pos = src.iter().position(|&b| b == b'3').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select 3");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select 3");
     }
 
     #[test]
@@ -699,32 +816,32 @@ mod tests {
         let src = b"a\n1,2\n";
         let out = parse_csv(src);
         let pos = src.iter().position(|&b| b == b'2').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select 2");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select 2");
         let meta = out.csv.as_ref().unwrap();
         assert_eq!(meta.col_widths.len(), 2);
+        assert_eq!(meta.col_selects, vec!["a", "2"]);
     }
 
     #[test]
     fn root_path_is_table() {
         let out = parse_csv(b"");
-        let entry = out.paths.lookup(0).unwrap();
-        let path = out.paths.path_of(entry);
-        assert_eq!(path_expression(&path, &out.names), "xsv table");
+        assert_eq!(expr_at(b"", &out, 0), "xsv table");
     }
 
     #[test]
-    fn value_bytes_cell_row_root() {
+    fn locate_finds_cell_row_and_record() {
         let out = parse_csv(SIMPLE);
-        let bytes = SIMPLE;
+        let meta = out.csv.as_ref().unwrap();
         // Cell: quoted field comes back verbatim, quotes included.
-        let pos = bytes.windows(4).position(|w| w == b"new ").unwrap() as u32;
-        let entry_idx = out.paths.lookup(pos).unwrap();
-        let entry = out.paths.entries[entry_idx as usize];
-        assert_eq!(value_bytes_for_entry(bytes, &entry), b"\"new york, ny\"");
-        // Row: whole record without the trailing newline.
-        let row_idx = out.paths.entries[entry_idx as usize].parent;
-        let row = out.paths.entries[row_idx as usize];
-        assert_eq!(value_bytes_for_entry(bytes, &row), b"bob,7,\"new york, ny\"");
+        let pos = SIMPLE.windows(4).position(|w| w == b"new ").unwrap() as u32;
+        let hit = locate(SIMPLE, &out.line_starts, meta.delimiter, pos);
+        let (s, e) = hit.cell.unwrap();
+        assert_eq!(&SIMPLE[s as usize..e as usize], b"\"new york, ny\"");
+        // Record: whole row without the trailing newline.
+        let (rs, re) = hit.record;
+        assert_eq!(&SIMPLE[rs as usize..re as usize], b"bob,7,\"new york, ny\"");
+        assert_eq!(hit.data_row, Some(1));
+        assert_eq!(hit.col, Some(2));
     }
 
     #[test]
@@ -734,9 +851,9 @@ mod tests {
         let meta = out.csv.as_ref().unwrap();
         assert_eq!(meta.col_widths, vec![1, 1]);
         let pos = src.iter().position(|&b| b == b'2').unwrap() as u32;
-        let entry_idx = out.paths.lookup(pos).unwrap();
-        let entry = out.paths.entries[entry_idx as usize];
-        assert_eq!(value_bytes_for_entry(src, &entry), b"2");
+        let hit = locate(src, &out.line_starts, b',', pos);
+        let (s, e) = hit.cell.unwrap();
+        assert_eq!(&src[s as usize..e as usize], b"2");
     }
 
     #[test]
@@ -744,7 +861,10 @@ mod tests {
         let out = parse(b"a\tb\n1\t2\n", b'\t', None);
         let meta = out.csv.as_ref().unwrap();
         assert_eq!(meta.col_widths, vec![1, 1]);
-        assert_eq!(expr_at(&out, 4), "xsv slice -i 0 | xsv select a");
+        assert_eq!(meta.delimiter, b'\t');
+        let src = b"a\tb\n1\t2\n";
+        let hit = locate(src, &out.line_starts, b'\t', 4);
+        assert_eq!(expression_for(meta, &hit), "xsv slice -i 0 | xsv select a");
     }
 
     #[test]
@@ -752,43 +872,43 @@ mod tests {
         let src = b"\xEF\xBB\xBFa,b\n1,2\n";
         let out = parse_csv(src);
         let pos = src.iter().position(|&b| b == b'1').unwrap() as u32;
-        assert_eq!(expr_at(&out, pos), "xsv slice -i 0 | xsv select a");
+        assert_eq!(expr_at(src, &out, pos), "xsv slice -i 0 | xsv select a");
     }
 
-    // --- layout mapping ---
+    // --- on-demand cells ---
 
-    fn cells_of_line(out: &ParseOutput, line: usize) -> Vec<(u32, u32)> {
-        let start = out.line_starts[line];
-        let next = out
-            .line_starts
-            .get(line + 1)
-            .copied()
-            .unwrap_or(u32::MAX);
-        record_cells(&out.paths.entries, start, next)
+    fn cells_of_line(src: &[u8], out: &ParseOutput, line: usize) -> Vec<(u32, u32)> {
+        scan_cells(src, out.line_starts[line], b',')
     }
 
     #[test]
-    fn record_cells_finds_row_fields() {
+    fn scan_cells_finds_row_fields() {
         let out = parse_csv(SIMPLE);
-        let cells = cells_of_line(&out, 1);
+        let cells = cells_of_line(SIMPLE, &out, 1);
         assert_eq!(cells.len(), 3);
         assert_eq!(&SIMPLE[cells[0].0 as usize..cells[0].1 as usize], b"alice");
         assert_eq!(&SIMPLE[cells[2].0 as usize..cells[2].1 as usize], b"sf");
     }
 
     #[test]
+    fn scan_cells_empty_past_eof() {
+        let out = parse_csv(SIMPLE);
+        // Phantom line after the trailing newline.
+        assert!(scan_cells(SIMPLE, *out.line_starts.last().unwrap(), b',').is_empty());
+    }
+
+    // --- layout mapping ---
+
+    #[test]
     fn visual_col_round_trip() {
         let out = parse_csv(SIMPLE);
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
-        // Byte of "30" (col 1, origin 7).
+        let cells = cells_of_line(SIMPLE, &out, 1);
         let b30 = SIMPLE.windows(2).position(|w| w == b"30").unwrap() as u32;
         assert_eq!(visual_col_of_byte(meta, &cells, SIMPLE, b30), 7);
         assert_eq!(visual_col_of_byte(meta, &cells, SIMPLE, b30 + 1), 8);
-        // Inverse: col 7 → byte of '3'; col 8 → byte of '0'.
         assert_eq!(byte_of_visual_col(meta, &cells, SIMPLE, 7), Some(b30));
         assert_eq!(byte_of_visual_col(meta, &cells, SIMPLE, 8), Some(b30 + 1));
-        // Gutter after "alice" (cols 5..6) collapses to end of field.
         assert_eq!(visual_col_of_byte(meta, &cells, SIMPLE, 14 + 5), 5);
         let back = byte_of_visual_col(meta, &cells, SIMPLE, 6).unwrap();
         assert_eq!(back, 14 + 5);
@@ -799,14 +919,14 @@ mod tests {
         let long = format!("h\n{}\n", "x".repeat(200));
         let out = parse_csv(long.as_bytes());
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
+        let cells = cells_of_line(long.as_bytes(), &out, 1);
         let end_byte = 2 + 200;
         assert_eq!(
             visual_col_of_byte(meta, &cells, long.as_bytes(), end_byte),
             MAX_COL_CHARS
         );
         let clicked = byte_of_visual_col(meta, &cells, long.as_bytes(), 500).unwrap();
-        assert_eq!(clicked, 2 + MAX_COL_CHARS); // clamped to the cap boundary
+        assert_eq!(clicked, 2 + MAX_COL_CHARS);
     }
 
     // --- rendering ---
@@ -815,14 +935,13 @@ mod tests {
     fn render_row_pads_and_colors() {
         let out = parse_csv(SIMPLE);
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
+        let cells = cells_of_line(SIMPLE, &out, 1);
         let rr = render_row(meta, &cells, SIMPLE, false, 0, 1000);
         assert_eq!(rr.origin_chars, 0);
         assert_eq!(rr.text, "alice  30   sf");
-        // "30" is numeric → one Number span at utf16 7..9.
         assert_eq!(rr.spans, vec![(7, 9, StyleKind::Number)]);
 
-        let hdr = render_row(meta, &cells_of_line(&out, 0), SIMPLE, true, 0, 1000);
+        let hdr = render_row(meta, &cells_of_line(SIMPLE, &out, 0), SIMPLE, true, 0, 1000);
         assert_eq!(hdr.text, "name   age  city");
         assert!(hdr.spans.iter().all(|s| s.2 == StyleKind::Key));
     }
@@ -832,25 +951,20 @@ mod tests {
         let long = format!("h,k\n{},z\n", "x".repeat(200));
         let out = parse_csv(long.as_bytes());
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
+        let cells = cells_of_line(long.as_bytes(), &out, 1);
         let rr = render_row(meta, &cells, long.as_bytes(), false, 0, 1000);
         let first: String = rr.text.chars().take(MAX_COL_CHARS as usize).collect();
         assert!(first.ends_with('…'));
         assert_eq!(first.chars().count(), MAX_COL_CHARS as usize);
         assert!(rr.text.ends_with('z'));
-        // The z column starts exactly at its origin.
-        assert_eq!(
-            rr.text.chars().count() as u32,
-            meta.col_origins[1] + 1
-        );
+        assert_eq!(rr.text.chars().count() as u32, meta.col_origins[1] + 1);
     }
 
     #[test]
     fn render_row_skips_cells_left_of_viewport() {
         let out = parse_csv(SIMPLE);
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
-        // Viewport starts inside the "city" column (origin 12).
+        let cells = cells_of_line(SIMPLE, &out, 1);
         let rr = render_row(meta, &cells, SIMPLE, false, 13, 1000);
         assert_eq!(rr.origin_chars, 12);
         assert_eq!(rr.text, "sf");
@@ -861,7 +975,7 @@ mod tests {
         let src = b"a,b\n1,\"x\ny\"\n";
         let out = parse_csv(src);
         let meta = out.csv.as_ref().unwrap();
-        let cells = cells_of_line(&out, 1);
+        let cells = cells_of_line(src, &out, 1);
         let rr = render_row(meta, &cells, src, false, 0, 1000);
         assert!(rr.text.contains('␤'));
         assert!(!rr.text.contains('\n'));
@@ -891,6 +1005,57 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_quote_runs_to_eof() {
+        let src = b"a,b\n1,\"oops\n2,3\n";
+        let out = parse_csv(src);
+        assert_eq!(out.line_starts.len(), 2);
+        assert!(out.error.is_none());
+    }
+
+    // --- incremental indexing ---
+
+    #[test]
+    fn budgeted_scan_matches_full_parse() {
+        let mut src = String::from("id,name,note\n");
+        for i in 0..500 {
+            use std::fmt::Write;
+            let _ = writeln!(src, "{i},row{i},\"note {i}, quoted\"");
+        }
+        let full = parse(src.as_bytes(), b',', None);
+
+        let mut ix = Indexer::new(src.as_bytes(), b',', None);
+        let mut snapshots = 0;
+        let mut last_lines = 0;
+        while !ix.scan(64) {
+            let snap = ix.snapshot();
+            assert!(snap.line_starts.len() >= last_lines, "snapshots only grow");
+            last_lines = snap.line_starts.len();
+            snapshots += 1;
+        }
+        assert!(snapshots > 3, "budget produced multiple snapshots");
+        let out = ix.into_output();
+        assert_eq!(out.line_starts, full.line_starts);
+        let (a, b) = (out.csv.unwrap(), full.csv.unwrap());
+        assert_eq!(a.col_widths, b.col_widths);
+        assert_eq!(a.col_selects, b.col_selects);
+    }
+
+    #[test]
+    fn widths_freeze_after_sample() {
+        // Sample covers the header + first row; the later, wider field
+        // and the quoted-newline record must not widen columns but must
+        // still index record boundaries correctly.
+        let src = b"a,b\n1,22\nlonger-than-sample,\"x\ny\"\n3,4\n";
+        let mut ix = Indexer::new(src, b',', None).with_sample_limit(9);
+        while !ix.scan(usize::MAX) {}
+        let out = ix.into_output();
+        let meta = out.csv.as_ref().unwrap();
+        assert_eq!(meta.col_widths, vec![1, 2], "post-freeze rows don't widen");
+        // Header + 3 data records + phantom trailing line.
+        assert_eq!(out.line_starts, vec![0, 4, 9, 34, 38]);
+    }
+
+    #[test]
     #[ignore]
     fn bench_parse_synthetic() {
         // ~10-col rows mimicking a log export; run with
@@ -913,24 +1078,14 @@ mod tests {
         let out = parse(bytes, b',', None);
         let dt = t0.elapsed();
 
-        let entries = out.paths.entries.len();
         eprintln!(
-            "parsed {:.1} MB in {:?} → {:.0} MB/s, entries={} ({:.1} MB index), lines={}",
+            "parsed {:.1} MB in {:?} → {:.0} MB/s, entries={}, index={:.1} MB ({} record starts)",
             size_mb,
             dt,
             size_mb / dt.as_secs_f64(),
-            entries,
-            (entries * std::mem::size_of::<PathEntry>()) as f64 / (1024.0 * 1024.0),
+            out.paths.entries.len(),
+            (out.line_starts.len() * std::mem::size_of::<Offset>()) as f64 / (1024.0 * 1024.0),
             out.line_starts.len(),
         );
-    }
-
-    #[test]
-    fn unterminated_quote_runs_to_eof() {
-        let src = b"a,b\n1,\"oops\n2,3\n";
-        let out = parse_csv(src);
-        // The unterminated quote swallows the rest — 2 records total.
-        assert_eq!(out.line_starts.len(), 2);
-        assert!(out.error.is_none());
     }
 }

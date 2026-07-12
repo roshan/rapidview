@@ -51,6 +51,12 @@ impl Document {
         progress: Option<&ProgressSink>,
     ) -> Arc<Self> {
         let output = format::parse(format, bytes.as_slice(), progress);
+        Self::from_parts(format, bytes, output)
+    }
+
+    /// Wrap an already-built `ParseOutput` (e.g. a snapshot from the
+    /// incremental CSV indexer) around shared bytes.
+    pub fn from_parts(format: Format, bytes: ByteSource, output: ParseOutput) -> Arc<Self> {
         let max_line_bytes = max_line_length(&output.line_starts, bytes.len() as u32);
         Arc::new(Self {
             bytes,

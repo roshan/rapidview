@@ -268,13 +268,18 @@ impl DocView {
 
     pub fn set_document(&self, doc: Arc<Document>) {
         let ivars = self.ivars();
-        // New documents always start in table mode; the flag is inert
-        // for non-CSV formats.
-        ivars.csv_table.set(true);
         self.resize_for_doc(&doc);
         *ivars.doc.borrow_mut() = Some(doc);
         self.setNeedsDisplay(true);
         self.refresh_path_display();
+    }
+
+    /// Reset to table mode without a resize — called when a *new*
+    /// document is loaded (`reset_doc_state`), but not on the snapshot
+    /// swaps of a progressive load, so a Table↔Original choice made
+    /// while a huge CSV is still indexing sticks.
+    pub fn reset_table_mode(&self) {
+        self.ivars().csv_table.set(true);
     }
 
     /// Size the frame for `doc` under the current view mode. CSV table
@@ -444,9 +449,9 @@ impl DocView {
         let col = if line >= line_starts.len() {
             0.0
         } else if let Some(meta) = active_csv_meta(doc, ivars.csv_table.get()) {
-            let (rs, ns) = record_bounds(doc, line);
-            let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
-            format::csv::visual_col_of_byte(meta, &cells, doc.bytes.as_slice(), offset) as f64
+            let bytes = doc.bytes.as_slice();
+            let cells = format::csv::scan_cells(bytes, line_starts[line], meta.delimiter);
+            format::csv::visual_col_of_byte(meta, &cells, bytes, offset) as f64
         } else {
             let line_bytes = doc.line_bytes(line);
             byte_offset_to_char_col(line_bytes, offset - line_starts[line]) as f64
@@ -486,6 +491,24 @@ impl DocView {
         let ivars = self.ivars();
         let doc = ivars.doc.borrow().as_ref().cloned()?;
         let bytes = doc.bytes.as_slice();
+        // CSV keeps no per-cell index — resolve the click by rescanning
+        // its record: cell if the click landed in one, else the row.
+        if let Some(meta) = doc.output.csv.as_ref() {
+            let slice = match ivars.last_click_offset.get() {
+                None => bytes,
+                Some(offset) => {
+                    let hit = format::csv::locate(
+                        bytes,
+                        &doc.output.line_starts,
+                        meta.delimiter,
+                        offset,
+                    );
+                    let (s, e) = hit.cell.unwrap_or(hit.record);
+                    &bytes[s as usize..e as usize]
+                }
+            };
+            return Some(String::from_utf8_lossy(slice).into_owned());
+        }
         let offset = ivars.last_click_offset.get().unwrap_or(0);
         let slice = match doc.output.paths.lookup(offset) {
             Some(idx) => {
@@ -505,6 +528,20 @@ impl DocView {
         let Some(doc) = ivars.doc.borrow().as_ref().cloned() else {
             return String::from(".");
         };
+        if let Some(meta) = doc.output.csv.as_ref() {
+            return match ivars.last_click_offset.get() {
+                None => "xsv table".to_string(),
+                Some(offset) => {
+                    let hit = format::csv::locate(
+                        doc.bytes.as_slice(),
+                        &doc.output.line_starts,
+                        meta.delimiter,
+                        offset,
+                    );
+                    format::csv::expression_for(meta, &hit)
+                }
+            };
+        }
         let segments = match ivars.last_click_offset.get() {
             Some(offset) => match doc.output.paths.lookup(offset) {
                 Some(entry) => doc.output.paths.path_of(entry),
@@ -620,15 +657,11 @@ impl DocView {
         let col = (x / ivars.advance).round() as usize;
 
         if let Some(meta) = active_csv_meta(&doc, ivars.csv_table.get()) {
-            let (rs, ns) = record_bounds(&doc, line_idx);
-            let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
-            return format::csv::byte_of_visual_col(
-                meta,
-                &cells,
-                doc.bytes.as_slice(),
-                col as u32,
-            )
-            .or(Some(rs));
+            let bytes = doc.bytes.as_slice();
+            let rs = doc.output.line_starts[line_idx];
+            let cells = format::csv::scan_cells(bytes, rs, meta.delimiter);
+            return format::csv::byte_of_visual_col(meta, &cells, bytes, col as u32)
+                .or(Some(rs));
         }
 
         let line_bytes = doc.line_bytes(line_idx);
@@ -703,8 +736,7 @@ impl DocView {
                     // A match truncated out of view collapses to zero
                     // width and is skipped.
                     let l_end = l_start + line_bytes.len() as u32;
-                    let (rs, ns) = record_bounds(&doc, line_idx);
-                    let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+                    let cells = format::csv::scan_cells(all_bytes, l_start, meta.delimiter);
                     let lo = search.matches.partition_point(|&m| m + match_len <= l_start);
                     let hi = search.matches.partition_point(|&m| m < l_end);
                     for idx in lo..hi {
@@ -779,8 +811,8 @@ impl DocView {
 
         for line_idx in first..=last {
             if let Some(meta) = csv_meta {
-                let (rs, ns) = record_bounds(&doc, line_idx);
-                let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+                let cells =
+                    format::csv::scan_cells(all_bytes, line_starts[line_idx], meta.delimiter);
                 let rr = format::csv::render_row(
                     meta,
                     &cells,
@@ -874,16 +906,6 @@ impl DocView {
 /// only for CSV/TSV documents with table mode on.
 fn active_csv_meta(doc: &Document, table_on: bool) -> Option<&format::csv::CsvMeta> {
     if table_on { doc.output.csv.as_ref() } else { None }
-}
-
-/// Byte range `[start, next_start)` of the record on `line`. The bound
-/// is the next record's start offset (`u32::MAX` for the last line) —
-/// what `csv::record_cells` expects.
-fn record_bounds(doc: &Document, line: usize) -> (u32, u32) {
-    let starts = &doc.output.line_starts;
-    let start = starts.get(line).copied().unwrap_or(0);
-    let next = starts.get(line + 1).copied().unwrap_or(u32::MAX);
-    (start, next)
 }
 
 fn byte_offset_to_char_col(s: &[u8], byte_off: u32) -> u32 {

@@ -86,6 +86,10 @@ mod app_state {
         /// on DocumentReady / PrettyReady / Error.
         pub progress: Option<Arc<ProgressSink>>,
         pub current_path: Option<String>,
+        /// Set while a progressive CSV load is streaming snapshots into
+        /// this tab — tells `on_document_ready` the final document is a
+        /// continuation (keep scroll/click/search), not a fresh open.
+        pub progressive_path: Option<String>,
         pub original_doc: Option<Arc<Document>>,
         pub pretty_doc: Option<Arc<Document>>,
         pub is_pretty: bool,
@@ -102,10 +106,12 @@ mod app_state {
             self.pretty_doc = None;
             self.is_pretty = false;
             self.pretty_pending = false;
+            self.progressive_path = None;
             self.saved_original = SavedViewport::default();
             self.saved_pretty = SavedViewport::default();
             self.doc_view.set_last_click_offset(None);
             self.doc_view.clear_search();
+            self.doc_view.reset_table_mode();
             self.prettify_button
                 .setTitle(&objc2_foundation::NSString::from_str("Prettify"));
         }
@@ -625,6 +631,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         progress_bar: hb.progress_bar,
         progress: None,
         current_path: None,
+        progressive_path: None,
         original_doc: None,
         pretty_doc: None,
         is_pretty: false,
@@ -1303,6 +1310,15 @@ fn drain_worker() {
                 on_document_ready(window_id, doc, &path);
                 app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
+            WorkerMsg::DocumentProgress {
+                window_id,
+                doc,
+                path,
+            } => {
+                // Non-terminal — WORK_PENDING stays up until the final
+                // DocumentReady so the poll timer keeps running.
+                on_document_progress(window_id, doc, &path);
+            }
             WorkerMsg::PrettyReady { window_id, doc } => {
                 on_pretty_ready(window_id, doc);
                 app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1368,13 +1384,42 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
     let fmt = doc.format;
     eprintln!("loaded {} ({} bytes, {} lines, {:?})", path, size, lines, fmt);
     with_window_mut(id, |state| {
-        state.reset_doc_state();
+        // The tail of a progressive load is a continuation of the doc
+        // the user is already browsing — swap the complete index in
+        // without resetting scroll, click, search, or view mode.
+        let continuation = state.progressive_path.as_deref() == Some(path);
+        if !continuation {
+            state.reset_doc_state();
+        }
+        state.progressive_path = None;
         state.original_doc = Some(doc.clone());
         state.current_path = Some(path.to_string());
         state.doc_view.set_document(doc);
         refresh_format_chrome(state, fmt);
         refresh_title(state);
         hide_progress(state);
+    });
+}
+
+/// A snapshot of a still-indexing CSV: install it so the file is
+/// browsable immediately; more rows appear as later snapshots land.
+fn on_document_progress(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &str) {
+    let fmt = doc.format;
+    eprintln!(
+        "indexing {} ({} lines so far)",
+        path,
+        doc.line_count().saturating_sub(1)
+    );
+    with_window_mut(id, |state| {
+        if state.progressive_path.as_deref() != Some(path) {
+            state.reset_doc_state();
+            state.progressive_path = Some(path.to_string());
+            state.current_path = Some(path.to_string());
+            refresh_format_chrome(state, fmt);
+            refresh_title(state);
+        }
+        state.original_doc = Some(doc.clone());
+        state.doc_view.set_document(doc);
     });
 }
 

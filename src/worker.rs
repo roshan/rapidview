@@ -35,6 +35,14 @@ pub enum WorkerMsg {
         doc: Arc<Document>,
         path: String,
     },
+    /// A browsable partial document (CSV progressive load): the mmap is
+    /// complete, the record index covers a prefix. Non-terminal — one
+    /// or more of these precede `DocumentReady` on large CSVs.
+    DocumentProgress {
+        window_id: WindowId,
+        doc: Arc<Document>,
+        path: String,
+    },
     /// The pretty-printed document is ready.
     PrettyReady {
         window_id: WindowId,
@@ -78,14 +86,43 @@ pub fn spawn_load(window_id: WindowId, path: String, tx: Sender<WorkerMsg>) {
             window_id,
             progress: progress.clone(),
         });
-        let doc = Document::from_source(format, source, Some(&progress));
-        let _ = tx.send(WorkerMsg::DocumentReady {
-            window_id,
-            doc,
-            path,
-        });
+        if format.is_tabular() {
+            // Progressive load: publish a browsable snapshot every
+            // CSV_SNAPSHOT_BYTES of scanned input so a multi-GB file
+            // can be read while its tail is still being indexed.
+            // Files smaller than one chunk behave exactly like the
+            // other formats (single DocumentReady).
+            let delimiter = if format == Format::Tsv { b'\t' } else { b',' };
+            let mut ix =
+                format::csv::Indexer::new(source.as_slice(), delimiter, Some(&progress));
+            while !ix.scan(CSV_SNAPSHOT_BYTES) {
+                let doc = Document::from_parts(format, source.clone(), ix.snapshot());
+                let _ = tx.send(WorkerMsg::DocumentProgress {
+                    window_id,
+                    doc,
+                    path: path.clone(),
+                });
+            }
+            let doc = Document::from_parts(format, source.clone(), ix.into_output());
+            let _ = tx.send(WorkerMsg::DocumentReady {
+                window_id,
+                doc,
+                path,
+            });
+        } else {
+            let doc = Document::from_source(format, source, Some(&progress));
+            let _ = tx.send(WorkerMsg::DocumentReady {
+                window_id,
+                doc,
+                path,
+            });
+        }
     });
 }
+
+/// How much input the CSV indexer scans between published snapshots.
+/// At ~800 MB/s that's a fresh batch of rows every ~third of a second.
+const CSV_SNAPSHOT_BYTES: usize = 256 << 20;
 
 /// Spawn a worker that parses an in-memory byte buffer (clipboard
 /// contents, typically) and delivers it as `DocumentReady` with the
@@ -196,6 +233,9 @@ mod tests {
             WorkerMsg::Error { message, .. } => panic!("unexpected worker error: {}", message),
             WorkerMsg::PrettyReady { .. } => panic!("got PrettyReady from spawn_load"),
             WorkerMsg::ParseStarted { .. } => panic!("expected DocumentReady, got ParseStarted"),
+            WorkerMsg::DocumentProgress { .. } => {
+                panic!("fixture is far below the snapshot threshold")
+            }
         }
     }
 

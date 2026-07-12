@@ -19,9 +19,8 @@ Run it in the background; stderr prints `loaded <path> (<bytes>, <lines>,
 `/tmp/rapid-view-panic.log` (stderr is /dev/null under Finder, and objc2
 debug builds panic on ObjC encoding mismatches — check there first).
 
-Note: a CLI launch loads the file **twice** (argv loop + AppKit's
-`application:openFile:` both fire) and opens two tabs. Known quirk, not a
-regression; Finder launches are fine.
+Large CSVs log `indexing <path> (N lines so far)` per 256 MB snapshot
+before the final `loaded` line — that's the progressive load working.
 
 ## Capture
 
@@ -31,7 +30,15 @@ screencapture -x -R<x>,<y>,<w>,<h> out.png
 ```
 
 Window may be on the secondary display → negative Y is normal and works
-with `-R`.
+with `-R`. If another window overlaps the region, capture by CGWindow id
+instead (no focus stealing, works occluded):
+
+```sh
+swift -e 'import CoreGraphics
+let l = CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as! [[String:Any]]
+for w in l where (w["kCGWindowOwnerName"] as? String)?.contains("rapid") == true && w["kCGWindowLayer"] as? Int == 0 { print(w["kCGWindowNumber"]!) }'
+screencapture -x -o -l<id> out.png
+```
 
 ## Drive
 
