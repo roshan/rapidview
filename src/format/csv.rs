@@ -891,6 +891,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn bench_parse_synthetic() {
+        // ~10-col rows mimicking a log export; run with
+        // cargo test -p rapid-view --release -- --ignored --nocapture
+        let mut src = String::with_capacity(256 * 1024 * 1024);
+        src.push_str("id,ts,user,event,dur_ms,host,region,status,bytes,note\n");
+        for i in 0..2_000_000u64 {
+            use std::fmt::Write;
+            let _ = writeln!(
+                src,
+                "{i},2026-07-12T10:{:02}:{:02}Z,user{},click_{},{}.{},host-{}.internal,us-west-{},{},{},\"note {i}, quoted\"",
+                i / 60 % 60, i % 60, i % 10_000, i % 37, i % 900, i % 10,
+                i % 64, i % 4, 200 + (i % 5) as u32, i % 100_000,
+            );
+        }
+        let bytes = src.as_bytes();
+        let size_mb = bytes.len() as f64 / (1024.0 * 1024.0);
+
+        let t0 = std::time::Instant::now();
+        let out = parse(bytes, b',', None);
+        let dt = t0.elapsed();
+
+        let entries = out.paths.entries.len();
+        eprintln!(
+            "parsed {:.1} MB in {:?} → {:.0} MB/s, entries={} ({:.1} MB index), lines={}",
+            size_mb,
+            dt,
+            size_mb / dt.as_secs_f64(),
+            entries,
+            (entries * std::mem::size_of::<PathEntry>()) as f64 / (1024.0 * 1024.0),
+            out.line_starts.len(),
+        );
+    }
+
+    #[test]
     fn unterminated_quote_runs_to_eof() {
         let src = b"a,b\n1,\"oops\n2,3\n";
         let out = parse_csv(src);
