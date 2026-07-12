@@ -1470,6 +1470,22 @@ fn main() {
         app_state::SELFTEST_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // AppKit synthesizes application:openFile: events from unknown argv
+    // arguments, and applicationDidFinishLaunching walks argv itself —
+    // so a CLI launch would load every file twice, into two tabs.
+    // Registering NSTreatUnknownArgumentsAsOpen=NO turns the synthesis
+    // off; Finder/`open` launches still arrive via application:openURLs:.
+    {
+        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("NSTreatUnknownArgumentsAsOpen");
+        let value = NSString::from_str("NO");
+        let dict = objc2_foundation::NSDictionary::from_slices(
+            &[&*key],
+            &[value.as_ref() as &AnyObject],
+        );
+        unsafe { defaults.registerDefaults(&dict) };
+    }
+
     let mtm = MainThreadMarker::new().expect("must run on main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);

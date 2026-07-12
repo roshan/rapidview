@@ -19,6 +19,7 @@ features = [
     "NSString",
     "NSArray",
     "NSDictionary",
+    "NSUserDefaults",
     "NSAttributedString",
     "NSNotification",
     "NSTimer",
