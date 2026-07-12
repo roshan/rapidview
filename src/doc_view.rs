@@ -57,6 +57,9 @@ pub struct DocViewIvars {
     last_click_offset: Cell<Option<u32>>,
     breadcrumb: RefCell<Option<Retained<NSTextField>>>,
     search: RefCell<SearchState>,
+    /// CSV/TSV only: draw as an aligned table (true, the default) or as
+    /// the raw source. Toggled by the window's Prettify button.
+    csv_table: Cell<bool>,
 }
 
 struct Colors {
@@ -151,15 +154,18 @@ define_class!(
                 "j" => self.move_cursor(1, 0),
                 "0" => self.move_cursor_bol(),
                 "$" => self.move_cursor_eol(),
+                // -[NSApplication sendAction:to:from:] returns BOOL —
+                // declaring `()` trips objc2's debug-build encoding
+                // check and panics the app on first keypress.
                 "n" => {
                     let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
-                    let _: () = unsafe {
+                    let _: bool = unsafe {
                         objc2::msg_send![&app, sendAction: objc2::sel!(rvSearchNext:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
                     };
                 }
                 "N" => {
                     let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
-                    let _: () = unsafe {
+                    let _: bool = unsafe {
                         objc2::msg_send![&app, sendAction: objc2::sel!(rvSearchPrev:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
                     };
                 }
@@ -173,7 +179,7 @@ define_class!(
                 }
                 "/" => {
                     let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
-                    let _: () = unsafe {
+                    let _: bool = unsafe {
                         objc2::msg_send![&app, sendAction: objc2::sel!(rvShowSearch:), to: std::ptr::null::<objc2::runtime::AnyObject>(), from: &*self]
                     };
                 }
@@ -254,6 +260,7 @@ impl DocView {
             last_click_offset: Cell::new(None),
             breadcrumb: RefCell::new(None),
             search: RefCell::new(SearchState::default()),
+            csv_table: Cell::new(true),
         };
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -261,19 +268,49 @@ impl DocView {
 
     pub fn set_document(&self, doc: Arc<Document>) {
         let ivars = self.ivars();
-
-        let line_count = doc.line_count() as f64;
-        let max_bytes = (doc.max_line_bytes as f64).min(MAX_LINE_BYTES_FOR_LAYOUT);
-        let content_h = (line_count * ivars.line_height) + PAD_TOP + PAD_BOTTOM;
-        let content_w = (max_bytes * ivars.advance) + PAD_LEFT + PAD_RIGHT;
-
-        let min_h = self.bounds().size.height.max(content_h);
-        let min_w = self.bounds().size.width.max(content_w);
-        self.setFrameSize(NSSize::new(min_w, min_h));
-
+        // New documents always start in table mode; the flag is inert
+        // for non-CSV formats.
+        ivars.csv_table.set(true);
+        self.resize_for_doc(&doc);
         *ivars.doc.borrow_mut() = Some(doc);
         self.setNeedsDisplay(true);
         self.refresh_path_display();
+    }
+
+    /// Size the frame for `doc` under the current view mode. CSV table
+    /// mode is as wide as the aligned table; everything else as wide as
+    /// the longest source line.
+    fn resize_for_doc(&self, doc: &Document) {
+        let ivars = self.ivars();
+        let width_chars = match doc.output.csv.as_ref() {
+            Some(meta) if ivars.csv_table.get() => meta.table_width as f64,
+            _ => doc.max_line_bytes as f64,
+        };
+        let line_count = doc.line_count() as f64;
+        let content_h = (line_count * ivars.line_height) + PAD_TOP + PAD_BOTTOM;
+        let content_w =
+            (width_chars.min(MAX_LINE_BYTES_FOR_LAYOUT) * ivars.advance) + PAD_LEFT + PAD_RIGHT;
+        // Fill at least the enclosing clip view so a short document
+        // doesn't leave the scroll area partially painted.
+        let base = unsafe { self.superview() }
+            .map(|clip| clip.bounds().size)
+            .unwrap_or(self.bounds().size);
+        let min_h = base.height.max(content_h);
+        let min_w = base.width.max(content_w);
+        self.setFrameSize(NSSize::new(min_w, min_h));
+    }
+
+    pub fn csv_table_mode(&self) -> bool {
+        self.ivars().csv_table.get()
+    }
+
+    pub fn set_csv_table_mode(&self, on: bool) {
+        self.ivars().csv_table.set(on);
+        let doc = self.ivars().doc.borrow().as_ref().cloned();
+        if let Some(doc) = doc {
+            self.resize_for_doc(&doc);
+        }
+        self.setNeedsDisplay(true);
     }
 
     pub fn last_click_offset(&self) -> Option<u32> {
@@ -404,11 +441,15 @@ impl DocView {
         let Some(doc) = doc_ref.as_ref() else { return };
         let line_starts = &doc.output.line_starts;
         let line = line_for_offset(offset, line_starts);
-        let col = if line < line_starts.len() {
+        let col = if line >= line_starts.len() {
+            0.0
+        } else if let Some(meta) = active_csv_meta(doc, ivars.csv_table.get()) {
+            let (rs, ns) = record_bounds(doc, line);
+            let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+            format::csv::visual_col_of_byte(meta, &cells, doc.bytes.as_slice(), offset) as f64
+        } else {
             let line_bytes = doc.line_bytes(line);
             byte_offset_to_char_col(line_bytes, offset - line_starts[line]) as f64
-        } else {
-            0.0
         };
         drop(doc_ref);
 
@@ -578,6 +619,18 @@ impl DocView {
         let x = (local.x - PAD_LEFT).max(0.0);
         let col = (x / ivars.advance).round() as usize;
 
+        if let Some(meta) = active_csv_meta(&doc, ivars.csv_table.get()) {
+            let (rs, ns) = record_bounds(&doc, line_idx);
+            let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+            return format::csv::byte_of_visual_col(
+                meta,
+                &cells,
+                doc.bytes.as_slice(),
+                col as u32,
+            )
+            .or(Some(rs));
+        }
+
         let line_bytes = doc.line_bytes(line_idx);
         let line_str = std::str::from_utf8(line_bytes).unwrap_or("");
         let mut byte_in_line = 0usize;
@@ -631,6 +684,8 @@ impl DocView {
         }
 
         let adv = ivars.advance;
+        let csv_meta = active_csv_meta(&doc, ivars.csv_table.get());
+        let all_bytes = doc.bytes.as_slice();
 
         let search = ivars.search.borrow();
         if !search.matches.is_empty() {
@@ -642,6 +697,41 @@ impl DocView {
             for line_idx in first..=last {
                 let l_start = line_starts[line_idx];
                 let line_bytes = doc.line_bytes(line_idx);
+
+                if let Some(meta) = csv_meta {
+                    // Table mode: matches map through the column layout.
+                    // A match truncated out of view collapses to zero
+                    // width and is skipped.
+                    let l_end = l_start + line_bytes.len() as u32;
+                    let (rs, ns) = record_bounds(&doc, line_idx);
+                    let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+                    let lo = search.matches.partition_point(|&m| m + match_len <= l_start);
+                    let hi = search.matches.partition_point(|&m| m < l_end);
+                    for idx in lo..hi {
+                        let m_start = search.matches[idx].max(l_start);
+                        let m_end = (search.matches[idx] + match_len).min(l_end);
+                        let ca = format::csv::visual_col_of_byte(meta, &cells, all_bytes, m_start);
+                        let cb = format::csv::visual_col_of_byte(meta, &cells, all_bytes, m_end);
+                        if cb <= ca {
+                            continue;
+                        }
+                        let color = if idx == search.current {
+                            &ivars.colors.search_current
+                        } else {
+                            &ivars.colors.search_match
+                        };
+                        let x = PAD_LEFT + ca as f64 * adv;
+                        let w = (cb - ca) as f64 * adv;
+                        let y = PAD_TOP + line_idx as f64 * line_h;
+                        color.setFill();
+                        objc2_app_kit::NSRectFill(NSRect::new(
+                            NSPoint::new(x, y),
+                            NSSize::new(w, line_h),
+                        ));
+                    }
+                    continue;
+                }
+
                 let line_str = std::str::from_utf8(line_bytes).unwrap_or("");
 
                 let (clip_byte_start, clip_byte_end) = char_range_to_byte_range(
@@ -688,6 +778,48 @@ impl DocView {
         let vis_col_end = ((dirty.origin.x + dirty.size.width - PAD_LEFT) / adv).ceil() as usize + 2;
 
         for line_idx in first..=last {
+            if let Some(meta) = csv_meta {
+                let (rs, ns) = record_bounds(&doc, line_idx);
+                let cells = format::csv::record_cells(&doc.output.paths.entries, rs, ns);
+                let rr = format::csv::render_row(
+                    meta,
+                    &cells,
+                    all_bytes,
+                    line_idx == 0,
+                    vis_col_start as u32,
+                    vis_col_end as u32,
+                );
+                if rr.text.is_empty() {
+                    continue;
+                }
+                let ns_str = NSString::from_str(&rr.text);
+                let attr_str = unsafe {
+                    NSMutableAttributedString::initWithString_attributes(
+                        NSMutableAttributedString::alloc(),
+                        &ns_str,
+                        Some(&ivars.default_attrs),
+                    )
+                };
+                for &(u16_start, u16_end, kind) in &rr.spans {
+                    let color = ivars.colors.for_kind(kind);
+                    let range = NSRange {
+                        location: u16_start,
+                        length: u16_end - u16_start,
+                    };
+                    unsafe {
+                        attr_str.addAttribute_value_range(
+                            NSForegroundColorAttributeName,
+                            color.as_ref() as &objc2::runtime::AnyObject,
+                            range,
+                        );
+                    }
+                }
+                let y = PAD_TOP + line_idx as f64 * line_h;
+                let x = PAD_LEFT + rr.origin_chars as f64 * adv;
+                attr_str.drawAtPoint(NSPoint::new(x, y));
+                continue;
+            }
+
             let line_start_byte = line_starts[line_idx];
             let full_bytes = doc.line_bytes(line_idx);
             let full_str = std::str::from_utf8(full_bytes).unwrap_or("");
@@ -699,7 +831,21 @@ impl DocView {
                 char_range_to_byte_range(full_str, vis_col_start, vis_col_end);
             let clipped = &full_str[clip_byte_start..clip_byte_end];
 
-            let ns_str = NSString::from_str(clipped);
+            // CSV raw mode: a "line" is a whole record, so a quoted
+            // field's embedded newline would wrap and overdraw the row
+            // below. Substitute control chars with picture glyphs —
+            // one glyph per char keeps the column math intact.
+            let drawn: std::borrow::Cow<'_, str> = if doc.output.csv.is_some()
+                && clipped.contains(|c: char| (c as u32) < 0x20)
+            {
+                std::borrow::Cow::Owned(
+                    clipped.chars().map(format::csv::display_char).collect(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(clipped)
+            };
+
+            let ns_str = NSString::from_str(&drawn);
             let attr_str = unsafe {
                 NSMutableAttributedString::initWithString_attributes(
                     NSMutableAttributedString::alloc(),
@@ -722,6 +868,22 @@ impl DocView {
             attr_str.drawAtPoint(pt);
         }
     }
+}
+
+/// Table layout to apply when drawing/mapping `doc`, if any: present
+/// only for CSV/TSV documents with table mode on.
+fn active_csv_meta(doc: &Document, table_on: bool) -> Option<&format::csv::CsvMeta> {
+    if table_on { doc.output.csv.as_ref() } else { None }
+}
+
+/// Byte range `[start, next_start)` of the record on `line`. The bound
+/// is the next record's start offset (`u32::MAX` for the last line) —
+/// what `csv::record_cells` expects.
+fn record_bounds(doc: &Document, line: usize) -> (u32, u32) {
+    let starts = &doc.output.line_starts;
+    let start = starts.get(line).copied().unwrap_or(0);
+    let next = starts.get(line + 1).copied().unwrap_or(u32::MAX);
+    (start, next)
 }
 
 fn byte_offset_to_char_col(s: &[u8], byte_off: u32) -> u32 {

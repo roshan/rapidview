@@ -358,6 +358,7 @@ impl<'a> Parser<'a> {
             names: self.names,
             error,
             bytes: self.input.len(),
+            csv: None,
         }
     }
 }

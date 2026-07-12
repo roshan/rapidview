@@ -1,0 +1,7 @@
+id,name,city,score,notes
+1,alice,"San Francisco, CA",91.5,likes long walks
+2,bob,"New York, NY",-3,"quoted ""notes"" here"
+3,carol,Berlin,7e2,this note is deliberately much longer than sixty-four characters so it exercises the column cap and ellipsis truncation path
+4,dave,"multi
+line city",0.25,embedded newline above
+5,eve,Lisbon,42,

@@ -1,8 +1,8 @@
 # Rapid View
 
-Native macOS viewer for JSON and XML files. Rust + AppKit via `objc2`/`objc2-app-kit`. No Electron, no web view. Multi-window with AppKit auto-tabbing.
+Native macOS viewer for JSON, XML, and CSV/TSV files. Rust + AppKit via `objc2`/`objc2-app-kit`. No Electron, no web view. Multi-window with AppKit auto-tabbing.
 
-This repo is a Cargo workspace. **Rapid View** (this crate) is one of three members; the others are **Markview** (a separate macOS app for markdown — see `markview/`) and **markdown-core** (the parser Markview depends on). Rapid View itself only handles JSON and XML; markdown lives in Markview because rendering it requires very different presentation.
+This repo is a Cargo workspace. **Rapid View** (this crate) is one of three members; the others are **Markview** (a separate macOS app for markdown — see `markview/`) and **markdown-core** (the parser Markview depends on). Rapid View handles JSON, XML, and CSV/TSV; markdown lives in Markview because rendering it requires very different presentation.
 
 ## File layout
 
@@ -13,6 +13,10 @@ src/format/mod.rs    shared types + dispatch (Format, ParseOutput, PathSegment,
 src/format/json.rs   JSON tokenizer + jq path formatter + prettifier
 src/format/xml.rs    XML tokenizer + XPath formatter + two-pass prettifier
                      (classify each element as block-or-mixed, then emit)
+src/format/csv.rs    CSV/TSV tokenizer + xsv path formatter + table-layout
+                     metadata (CsvMeta: per-column widths/origins) + the
+                     draw-time helpers DocView uses (record_cells,
+                     visual_col_of_byte, byte_of_visual_col, render_row)
 src/doc.rs           Document = bytes + format + ParseOutput + max_line_bytes.
                      ByteSource is Arc<Mmap> for files, Arc<[u8]> for clipboard
                      and prettify output.
@@ -29,7 +33,7 @@ markview/            Separate binary crate — Markview app. NSTextView-based
                      viewer with rendered/source mode toggle.
 ```
 
-The renderer is format-agnostic — `ParseOutput` is identical between JSON and XML. Anything format-specific (path expression, sub-tree extraction, pretty-printer) dispatches on `Format` at the call site, e.g. `format::path_expression(doc.format, ...)`.
+The renderer is format-agnostic — `ParseOutput` is identical between JSON and XML. Anything format-specific (path expression, sub-tree extraction, pretty-printer) dispatches on `Format` at the call site, e.g. `format::path_expression(doc.format, ...)`. The one exception is CSV: `ParseOutput.csv` carries table-layout metadata, and `DocView` renders CSV as an aligned table computed **at draw time** — fields drawn at column origins, capped at 64 chars with a visual-only `…` (the mmapped bytes are never copied or padded, so Copy always yields the full field). `line_starts` for CSV are *record* starts; embedded newlines in quoted fields render as `␤` via `csv::display_char` in both table and raw mode.
 
 ## Critical conventions
 
@@ -37,7 +41,8 @@ The renderer is format-agnostic — `ParseOutput` is identical between JSON and 
 - objc2 `define_class!` for AppKit subclasses (`RVAppDelegate`, `RVDocView`).
 - Per-tab state lives in `app_state::WINDOWS: HashMap<WindowId, WindowState>`. `WindowId` is the raw `NSWindow` pointer reinterpreted as `usize` — stable for the window's lifetime, never dereferenced.
 - One worker thread per request. Worker emits `ParseStarted` first (carrying `Arc<ProgressSink>`), then exactly one terminal message: `DocumentReady`, `PrettyReady`, or `Error`. `WORK_PENDING` only decrements on terminal messages; the poll timer tears down when it hits zero.
-- Format auto-detection: `format::detect` looks at the first non-whitespace byte after a possible UTF-8 BOM. `<` → XML, else JSON.
+- Format auto-detection: `format::detect` looks at the first non-whitespace byte after a possible UTF-8 BOM. `<` → XML, else JSON. CSV/TSV are picked by **file extension only** (`detect_for_path`: `.csv` / `.tsv` / `.tab`) — never by content sniffing, so clipboard pastes can't become CSV (deliberate, per Roshan).
+- For CSV docs the Prettify button is a Table ↔ Original toggle (`DocView::set_csv_table_mode`) — a draw-flag flip, no worker round-trip, no second `Document`. `format::prettify` is never invoked for CSV.
 
 ## Build / test / deploy
 
@@ -67,11 +72,12 @@ mise run deploy-all                   # both apps in one go
 
 ObjC selectors on `RVAppDelegate`: `rvNewWindow:`, `rvOpenDocument:`, `rvTogglePrettify:`, `rvPaste:`, `rvClearDocument:`, `rvCopyPath:`, `rvCopySubtree:`, `rvShowSearch:`, `rvSearchNext:`, `rvSearchPrev:`, `rvDismissSearch:`, `rvSearchFieldAction:`, `rvSearchChanged:`, `rvWorkerTick:`.
 
-Toolbar buttons "Copy jq" / "Copy XPath" and "Copy JSON" / "Copy XML" have their titles updated by `refresh_format_chrome` when a document loads.
+Toolbar buttons "Copy jq" / "Copy XPath" / "Copy xsv" and "Copy JSON" / "Copy XML" / "Copy CSV" have their titles updated by `refresh_format_chrome` when a document loads (which also sets the Prettify button to "Original" for CSV). CSV path expressions are xsv pipelines: cell → `xsv slice -i R | xsv select C`, header → `xsv select C`, root → `xsv table`.
 
 ## Fixtures
 
 - `fixtures/sample.json`, `fixtures/sample.xml` — small clean inputs.
+- `fixtures/sample.csv` — exercises quoting, `""` escapes, an over-64-char field (truncation), an embedded newline, and a trailing empty field.
 - `fixtures/reddit.json`, `fixtures/large.json` — bigger inputs.
 - `~/Downloads/apple_health_export/export.xml` (1.4 GB) — a known stress test on Roshan's machine, not in the repo.
 

@@ -72,7 +72,7 @@ pub fn spawn_load(window_id: WindowId, path: String, tx: Sender<WorkerMsg>) {
                 return;
             }
         };
-        let format = format::detect(source.as_slice());
+        let format = format::detect_for_path(&path, source.as_slice());
         let progress = Arc::new(ProgressSink::new(source.len() as u64));
         let _ = tx.send(WorkerMsg::ParseStarted {
             window_id,
@@ -196,6 +196,25 @@ mod tests {
             WorkerMsg::Error { message, .. } => panic!("unexpected worker error: {}", message),
             WorkerMsg::PrettyReady { .. } => panic!("got PrettyReady from spawn_load"),
             WorkerMsg::ParseStarted { .. } => panic!("expected DocumentReady, got ParseStarted"),
+        }
+    }
+
+    #[test]
+    fn spawn_load_csv_by_extension() {
+        let chan = WorkerChannel::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample.csv").to_string();
+        spawn_load(TEST_WINDOW_ID, path, chan.tx.clone());
+        match recv_after_started(&chan) {
+            WorkerMsg::DocumentReady { doc, .. } => {
+                assert_eq!(doc.format, Format::Csv);
+                let meta = doc.output.csv.as_ref().expect("csv meta present");
+                assert_eq!(meta.col_widths.len(), 5);
+                // Header + 5 data rows (+ phantom line after trailing \n);
+                // the embedded newline must not add a record.
+                assert_eq!(doc.line_count(), 7);
+            }
+            WorkerMsg::Error { message, .. } => panic!("unexpected worker error: {}", message),
+            _ => panic!("wrong message type"),
         }
     }
 

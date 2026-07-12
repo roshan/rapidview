@@ -1,11 +1,13 @@
 //! Format-agnostic parsing API.
 //!
-//! `detect` sniffs the first non-whitespace byte to pick JSON vs XML.
-//! Parsing produces a `ParseOutput` the renderer treats identically
-//! regardless of source format — the format-specific bits (path
-//! expression, pretty-printer, sub-tree extraction) live behind
+//! `detect` sniffs the first non-whitespace byte to pick JSON vs XML;
+//! CSV/TSV are chosen by file extension only (`detect_for_path`), never
+//! by content. Parsing produces a `ParseOutput` the renderer treats
+//! identically regardless of source format — the format-specific bits
+//! (path expression, pretty-printer, sub-tree extraction) live behind
 //! dispatch functions that switch on `Format`.
 
+pub mod csv;
 pub mod json;
 pub mod xml;
 
@@ -50,6 +52,15 @@ pub type Offset = u32;
 pub enum Format {
     Json,
     Xml,
+    Csv,
+    Tsv,
+}
+
+impl Format {
+    /// CSV-family formats render as a column-aligned table in DocView.
+    pub fn is_tabular(self) -> bool {
+        matches!(self, Format::Csv | Format::Tsv)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +211,8 @@ pub struct ParseOutput {
     pub error: Option<ParseError>,
     #[allow(dead_code)]
     pub bytes: usize,
+    /// Table layout metadata — `Some` for CSV/TSV documents only.
+    pub csv: Option<csv::CsvMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +253,21 @@ pub fn detect(bytes: &[u8]) -> Format {
     Format::Json
 }
 
+/// Format for a file at `path`: `.csv` / `.tsv` / `.tab` extensions
+/// pick the CSV family (extension only — no content sniffing for CSV);
+/// anything else falls back to content `detect`.
+pub fn detect_for_path(path: &str, bytes: &[u8]) -> Format {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("csv") => Format::Csv,
+        Some("tsv") | Some("tab") => Format::Tsv,
+        _ => detect(bytes),
+    }
+}
+
 pub fn parse(
     format: Format,
     input: &[u8],
@@ -248,6 +276,8 @@ pub fn parse(
     match format {
         Format::Json => json::parse(input, progress),
         Format::Xml => xml::parse(input, progress),
+        Format::Csv => csv::parse(input, b',', progress),
+        Format::Tsv => csv::parse(input, b'\t', progress),
     }
 }
 
@@ -255,6 +285,9 @@ pub fn prettify(format: Format, input: &[u8]) -> Vec<u8> {
     match format {
         Format::Json => json::prettify(input),
         Format::Xml => xml::prettify(input),
+        // CSV never round-trips through the prettifier — the table view
+        // is draw-time layout and the toggle flips a DocView flag.
+        Format::Csv | Format::Tsv => input.to_vec(),
     }
 }
 
@@ -266,6 +299,7 @@ pub fn path_expression(
     match format {
         Format::Json => json::path_expression(segments, names),
         Format::Xml => xml::path_expression(segments, names),
+        Format::Csv | Format::Tsv => csv::path_expression(segments, names),
     }
 }
 
@@ -277,6 +311,7 @@ pub fn value_bytes_for_entry<'a>(
     match format {
         Format::Json => json::value_bytes_for_entry(bytes, entry),
         Format::Xml => xml::value_bytes_for_entry(bytes, entry),
+        Format::Csv | Format::Tsv => csv::value_bytes_for_entry(bytes, entry),
     }
 }
 
@@ -286,6 +321,7 @@ pub fn path_label(format: Format) -> &'static str {
     match format {
         Format::Json => "jq",
         Format::Xml => "XPath",
+        Format::Csv | Format::Tsv => "xsv",
     }
 }
 
@@ -295,6 +331,8 @@ pub fn content_label(format: Format) -> &'static str {
     match format {
         Format::Json => "JSON",
         Format::Xml => "XML",
+        Format::Csv => "CSV",
+        Format::Tsv => "TSV",
     }
 }
 
@@ -311,5 +349,17 @@ mod tests {
         assert_eq!(detect(b"\n  <?xml version=\"1.0\"?><a/>"), Format::Xml);
         assert_eq!(detect(b"\xEF\xBB\xBF<a/>"), Format::Xml);
         assert_eq!(detect(b""), Format::Json);
+    }
+
+    #[test]
+    fn detect_for_path_uses_extension_for_csv_only() {
+        assert_eq!(detect_for_path("/x/data.csv", b"a,b\n"), Format::Csv);
+        assert_eq!(detect_for_path("/x/DATA.CSV", b"a,b\n"), Format::Csv);
+        assert_eq!(detect_for_path("/x/data.tsv", b"a\tb\n"), Format::Tsv);
+        assert_eq!(detect_for_path("/x/data.tab", b"a\tb\n"), Format::Tsv);
+        // Everything else falls back to content sniffing.
+        assert_eq!(detect_for_path("/x/data.json", b"{}"), Format::Json);
+        assert_eq!(detect_for_path("/x/data.txt", b"<a/>"), Format::Xml);
+        assert_eq!(detect_for_path("/x/noext", b"a,b\n"), Format::Json);
     }
 }

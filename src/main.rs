@@ -1145,10 +1145,20 @@ fn toggle_prettify(id: WindowId) {
         SwapToOriginal(std::sync::Arc<doc::Document>),
         SwapToCachedPretty(std::sync::Arc<doc::Document>),
         SpawnPretty(Format, doc::ByteSource),
+        /// CSV/TSV: table layout is draw-time, so the toggle just flips
+        /// a DocView flag — no worker, no second document.
+        ToggleCsvTable,
         Nothing,
     }
 
     let action = with_window(id, |state| {
+        if state
+            .original_doc
+            .as_ref()
+            .is_some_and(|d| d.format.is_tabular())
+        {
+            return Action::ToggleCsvTable;
+        }
         if state.is_pretty {
             return state
                 .original_doc
@@ -1169,6 +1179,17 @@ fn toggle_prettify(id: WindowId) {
 
     match action {
         Action::Nothing => {}
+        Action::ToggleCsvTable => {
+            with_window_mut(id, |state| {
+                let on = !state.doc_view.csv_table_mode();
+                state.doc_view.set_csv_table_mode(on);
+                if on {
+                    set_underlined_title(&state.prettify_button, "Original", 'O');
+                } else {
+                    set_underlined_title(&state.prettify_button, "Table", 'T');
+                }
+            });
+        }
         Action::SwapToOriginal(doc) => {
             with_window_mut(id, |state| {
                 state.saved_pretty = save_viewport(state);
@@ -1358,7 +1379,9 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
 }
 
 /// Update toolbar button titles to reflect the loaded document's
-/// format ("Copy jq" / "Copy XPath", "Copy JSON" / "Copy XML").
+/// format ("Copy jq" / "Copy XPath" / "Copy xsv", "Copy JSON" / "Copy
+/// XML" / "Copy CSV"). For CSV the Prettify button becomes the table ↔
+/// original toggle, starting in table mode.
 fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
     let path_label = format::path_label(fmt);
     let content_label = format::content_label(fmt);
@@ -1370,6 +1393,11 @@ fn refresh_format_chrome(state: &app_state::WindowState, fmt: Format) {
     state
         .copy_subtree_button
         .setTitle(&NSString::from_str(&format!("Copy {}", content_label)));
+    if fmt.is_tabular() {
+        set_underlined_title(&state.prettify_button, "Original", 'O');
+    } else {
+        set_underlined_title(&state.prettify_button, "Prettify", 'P');
+    }
 }
 
 fn on_pretty_ready(id: WindowId, doc: std::sync::Arc<doc::Document>) {
