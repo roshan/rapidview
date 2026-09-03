@@ -31,12 +31,38 @@ src/main.rs          AppDelegate, window/tab management, menu bar, toolbar,
 markdown-core/       Markdown parser + types (path tree + per-line BlockKind
                      classification). Used by Markview, not by Rapid View.
 markview/            Separate binary crate — Markview app. NSTextView-based
-                     viewer with rendered/source mode toggle.
+                     viewer with rendered/source mode toggle. See "Markview
+                     layout" below.
 ```
 
 The renderer is format-agnostic — `ParseOutput` is identical between JSON and XML. Anything format-specific (path expression, sub-tree extraction, pretty-printer) dispatches on `Format` at the call site, e.g. `format::path_expression(doc.format, ...)`. The one exception is CSV: `ParseOutput.csv` carries table-layout metadata, and `DocView` renders CSV as an aligned table computed **at draw time** — fields drawn at column origins, capped at 64 chars with a visual-only `…` (the mmapped bytes are never copied or padded, so Copy always yields the full field). `line_starts` for CSV are *record* starts; embedded newlines in quoted fields render as `␤` via `csv::display_char` in both table and raw mode.
 
 CSV keeps **no per-cell index** (RAPIDVIEW-2): the only per-row state is `line_starts` (4 B/record). Cell ranges, click→cell resolution, and copy ranges are re-derived per record on demand (`csv::scan_cells` / `csv::locate` — a frame only needs the ~60 visible rows), so CSV clicks never go through `PathIndex`. Column widths come from the first 16 MB (`WIDTH_SAMPLE_BYTES`), then the indexer freezes layout and degrades to a fast record-boundary scan (~1.5 GB/s). Large CSVs load **progressively**: the worker publishes a browsable `DocumentProgress` snapshot every 256 MB scanned, then a final `DocumentReady` that swaps in without resetting scroll/click/search (`WindowState.progressive_path` marks the continuation).
+
+## Markview layout
+
+- **Zoom is a reflow, not a bitmap magnify.** `rendered::build` and
+  `source::build_with_parse` take a `scale`; ⌘+/⌘−/⌘0 and trackpad pinch
+  (`MVTextView::magnifyWithEvent:`) rebuild both attributed strings at
+  the new scale and restore the scroll fraction. Zoom persists in
+  `NSUserDefaults` under `MVZoom` and applies to new windows.
+- **Text column is capped at `MAX_MEASURE` (720 pt × zoom) and centred**
+  by `MVTextView::update_inset`, which recomputes `textContainerInset`
+  on every `setFrameSize:`. Don't set the inset anywhere else.
+- **Consecutive Paragraph / BlockquoteLine source lines are joined** into
+  one paragraph (`join_soft_lines`) so text wraps to the column, not to
+  the author's editor. Two trailing spaces or a trailing `\` become a
+  hard break (U+2028).
+- **Fenced code is ONE paragraph** with lines joined by U+2028 so its
+  `NSTextBlock` background is a single rectangle (per-line paragraphs
+  leave hairline seams). `MVTextView::copy:` turns U+2028 back into
+  `\n`, so keep that override if you touch either side.
+- **Bare (non-table) `NSTextBlock`s need an explicit 100% width**
+  (`Builder::full_width_block`) or they shrink to one glyph per line.
+  Blockquote rule, horizontal rule, and code background all use it.
+- Links get no underline: `linkTextAttributes` on the text view is set
+  to colour + hand cursor only, because NSTextView's default overrides
+  whatever the attributed string says.
 
 ## Critical conventions
 

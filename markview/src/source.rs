@@ -7,29 +7,41 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSColor, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSColor, NSFont, NSFontAttributeName, NSFontWeightRegular, NSForegroundColorAttributeName,
+    NSMutableParagraphStyle, NSParagraphStyleAttributeName,
 };
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableAttributedString, NSRange, NSString,
 };
 
 const SOURCE_FONT_SIZE: f64 = 13.0;
+const SOURCE_LINE_HEIGHT: f64 = 1.3;
 
 pub fn build_with_parse(
     bytes: &[u8],
     parse: Option<&ParseOutput>,
+    scale: f64,
 ) -> Retained<NSAttributedString> {
     let s = std::str::from_utf8(bytes).unwrap_or("");
     let ns_str = NSString::from_str(s);
-    let font = NSFont::userFixedPitchFontOfSize(SOURCE_FONT_SIZE)
-        .expect("user fixed-pitch font is always available");
+    let font = NSFont::monospacedSystemFontOfSize_weight(SOURCE_FONT_SIZE * scale, unsafe {
+        NSFontWeightRegular
+    });
     let default_fg = NSColor::textColor();
+    let pstyle = NSMutableParagraphStyle::new();
+    pstyle.setLineHeightMultiple(SOURCE_LINE_HEIGHT);
 
-    let keys: [&NSString; 2] =
-        unsafe { [NSFontAttributeName, NSForegroundColorAttributeName] };
-    let values: [&AnyObject; 2] = [
+    let keys: [&NSString; 3] = unsafe {
+        [
+            NSFontAttributeName,
+            NSForegroundColorAttributeName,
+            NSParagraphStyleAttributeName,
+        ]
+    };
+    let values: [&AnyObject; 3] = [
         font.as_ref() as &AnyObject,
         default_fg.as_ref() as &AnyObject,
+        pstyle.as_ref() as &AnyObject,
     ];
     let default_attrs = NSDictionary::from_slices(&keys, &values);
 

@@ -17,11 +17,13 @@ use doc::Document;
 use markdown_core::ProgressSink;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSColor,
-    NSEventModifierFlags, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSColor, NSCursor,
+    NSCursorAttributeName, NSEvent, NSEventModifierFlags, NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
     NSLayoutConstraint, NSLayoutConstraintOrientation, NSLayoutManager, NSLineBreakMode,
     NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSPasteboard, NSPasteboardTypeString,
     NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSStackView,
@@ -30,9 +32,10 @@ use objc2_app_kit::{
     NSWindowTabbingMode,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol,
-    NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
+    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSNotification, NSObject,
+    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL, NSUserDefaults,
 };
+use std::cell::Cell;
 use std::sync::Arc;
 use worker::{WindowId, WorkerChannel, WorkerMsg};
 
@@ -42,13 +45,151 @@ enum Mode {
     Source,
 }
 
+// -- zoom ------------------------------------------------------------
+
+/// Discrete zoom stops. ⌘+ / ⌘− step through these; ⌘0 returns to 1.0.
+const ZOOM_STEPS: &[f64] = &[0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0];
+const ZOOM_DEFAULTS_KEY: &str = "MVZoom";
+
+/// Widest the text column gets at zoom 1.0. Long lines are the single
+/// biggest readability problem in a wide window, so the column is
+/// capped and centred (see `MVTextView::update_inset`). Scales with
+/// zoom so the characters-per-line stays roughly constant.
+const MAX_MEASURE: f64 = 720.0;
+const MIN_INSET_X: f64 = 28.0;
+const INSET_Y: f64 = 28.0;
+
+fn saved_zoom() -> f64 {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let z = defaults.doubleForKey(&NSString::from_str(ZOOM_DEFAULTS_KEY));
+    if z.is_finite() && z >= ZOOM_STEPS[0] && z <= *ZOOM_STEPS.last().unwrap() {
+        z
+    } else {
+        1.0
+    }
+}
+
+fn save_zoom(z: f64) {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    defaults.setDouble_forKey(z, &NSString::from_str(ZOOM_DEFAULTS_KEY));
+}
+
+fn zoom_step(current: f64, direction: i32) -> f64 {
+    // Nearest stop to `current`, then one step in `direction`.
+    let mut idx = 0;
+    let mut best = f64::MAX;
+    for (i, &z) in ZOOM_STEPS.iter().enumerate() {
+        let d = (z - current).abs();
+        if d < best {
+            best = d;
+            idx = i;
+        }
+    }
+    let next = (idx as i32 + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize;
+    ZOOM_STEPS[next]
+}
+
+// -- text view subclass ----------------------------------------------
+
+struct TextViewIvars {
+    zoom: Cell<f64>,
+    /// Accumulated pinch magnification since the last zoom step.
+    pinch: Cell<f64>,
+}
+
+define_class!(
+    #[unsafe(super(NSTextView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MVTextView"]
+    #[ivars = TextViewIvars]
+    struct MVTextView;
+
+    impl MVTextView {
+        /// Re-centre the column whenever the view's width changes.
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, new_size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            self.update_inset();
+        }
+
+        /// Copy as plain text with U+2028 (used inside code blocks, see
+        /// `rendered::emit_pre_block`) turned back into real newlines.
+        #[unsafe(method(copy:))]
+        fn copy(&self, _sender: Option<&AnyObject>) {
+            let range = self.selectedRange();
+            if range.length == 0 {
+                return;
+            }
+            let text = self.string().substringWithRange(range).to_string();
+            let text = text.replace('\u{2028}', "\n");
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            unsafe {
+                let type_str: &NSString = NSPasteboardTypeString;
+                pb.setString_forType(&NSString::from_str(&text), type_str);
+            }
+        }
+
+        /// Trackpad pinch → stepwise zoom. Accumulate the gesture's
+        /// magnification and fire a step every ±0.12 so a single pinch
+        /// walks a few stops rather than jumping to the extremes.
+        #[unsafe(method(magnifyWithEvent:))]
+        fn magnify_with_event(&self, event: &NSEvent) {
+            let acc = self.ivars().pinch.get() + event.magnification();
+            const STEP: f64 = 0.12;
+            if acc.abs() >= STEP {
+                let dir = if acc > 0.0 { 1 } else { -1 };
+                self.ivars().pinch.set(acc - dir as f64 * STEP);
+                if let Some(id) = window_id_from_sender(self) {
+                    zoom_by(id, dir);
+                }
+            } else {
+                self.ivars().pinch.set(acc);
+            }
+        }
+    }
+);
+
+impl MVTextView {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        container: &NSTextContainer,
+        zoom: f64,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(TextViewIvars {
+            zoom: Cell::new(zoom),
+            pinch: Cell::new(0.0),
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame, textContainer: container] }
+    }
+
+    fn set_zoom(&self, zoom: f64) {
+        self.ivars().zoom.set(zoom);
+        self.update_inset();
+    }
+
+    /// Horizontal inset = whatever centres a `MAX_MEASURE * zoom` column
+    /// in the current width, never less than `MIN_INSET_X`.
+    fn update_inset(&self) {
+        let width = self.frame().size.width;
+        let max_measure = MAX_MEASURE * self.ivars().zoom.get();
+        let inset_x = ((width - max_measure) / 2.0).max(MIN_INSET_X).floor();
+        let current = self.textContainerInset();
+        if (current.width - inset_x).abs() > 0.5 {
+            self.setTextContainerInset(NSSize::new(inset_x, INSET_Y));
+        }
+    }
+}
+
 mod app_state {
     use crate::Mode;
     use crate::doc::Document;
     use crate::worker::{WindowId, WorkerChannel};
     use markdown_core::ProgressSink;
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSButton, NSProgressIndicator, NSTextView, NSWindow};
+    use crate::MVTextView;
+    use objc2_app_kit::{NSButton, NSProgressIndicator, NSWindow};
     use objc2_foundation::{NSAttributedString, NSTimer};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -57,7 +198,7 @@ mod app_state {
 
     pub struct WindowState {
         pub window: Retained<NSWindow>,
-        pub text_view: Retained<NSTextView>,
+        pub text_view: Retained<MVTextView>,
         pub toggle_button: Retained<NSButton>,
         pub progress_bar: Retained<NSProgressIndicator>,
         pub progress: Option<Arc<ProgressSink>>,
@@ -66,6 +207,7 @@ mod app_state {
         pub rendered: Option<Retained<NSAttributedString>>,
         pub source: Option<Retained<NSAttributedString>>,
         pub mode: Mode,
+        pub zoom: f64,
     }
 
     thread_local! {
@@ -189,6 +331,27 @@ define_class!(
             }
         }
 
+        #[unsafe(method(mvZoomIn:))]
+        fn mv_zoom_in(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                zoom_by(id, 1);
+            }
+        }
+
+        #[unsafe(method(mvZoomOut:))]
+        fn mv_zoom_out(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                zoom_by(id, -1);
+            }
+        }
+
+        #[unsafe(method(mvZoomReset:))]
+        fn mv_zoom_reset(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                set_zoom(id, 1.0);
+            }
+        }
+
         #[unsafe(method(mvWorkerTick:))]
         fn mv_worker_tick(&self, _timer: &NSTimer) {
             drain_worker();
@@ -294,6 +457,24 @@ fn install_menu_bar(mtm: MainThreadMarker) {
         "k",
         NSEventModifierFlags::Command,
     );
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // "=" is the unshifted key on the same cap as "+", so ⌘= works too —
+    // the standard macOS Zoom In binding shows as ⌘+ but accepts both.
+    add_menu_item(mtm, &view_menu, "Zoom In", objc2::sel!(mvZoomIn:), "+", NSEventModifierFlags::Command);
+    let alt_zoom_in = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Zoom In"),
+            Some(objc2::sel!(mvZoomIn:)),
+            &NSString::from_str("="),
+        )
+    };
+    alt_zoom_in.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+    alt_zoom_in.setAlternate(true);
+    alt_zoom_in.setHidden(true);
+    view_menu.addItem(&alt_zoom_in);
+    add_menu_item(mtm, &view_menu, "Zoom Out", objc2::sel!(mvZoomOut:), "-", NSEventModifierFlags::Command);
+    add_menu_item(mtm, &view_menu, "Actual Size", objc2::sel!(mvZoomReset:), "0", NSEventModifierFlags::Command);
     view_menu_item.setSubmenu(Some(&view_menu));
 
     let app = NSApplication::sharedApplication(mtm);
@@ -370,7 +551,8 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     scroll.setAutohidesScrollers(true);
     scroll.setBorderType(NSBorderType::NoBorder);
 
-    let text_view = build_text_view(mtm, &scroll);
+    let zoom = saved_zoom();
+    let text_view = build_text_view(mtm, &scroll, zoom);
     scroll.setDocumentView(Some(&text_view));
 
     let delegate_obj = delegate as &AnyObject;
@@ -409,6 +591,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         rendered: None,
         source: None,
         mode: Mode::Rendered,
+        zoom,
     };
     app_state::WINDOWS.with(|m| {
         m.borrow_mut().insert(id, state);
@@ -416,7 +599,11 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
     id
 }
 
-fn build_text_view(mtm: MainThreadMarker, scroll: &NSScrollView) -> Retained<NSTextView> {
+fn build_text_view(
+    mtm: MainThreadMarker,
+    scroll: &NSScrollView,
+    zoom: f64,
+) -> Retained<MVTextView> {
     let content_size = scroll.contentSize();
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), content_size);
     // Construct an explicit TextKit 1 stack so NSTextTable lays tables
@@ -430,11 +617,7 @@ fn build_text_view(mtm: MainThreadMarker, scroll: &NSScrollView) -> Retained<NST
     );
     storage.addLayoutManager(&layout_manager);
     layout_manager.addTextContainer(&container);
-    let tv = NSTextView::initWithFrame_textContainer(
-        NSTextView::alloc(mtm),
-        frame,
-        Some(&container),
-    );
+    let tv = MVTextView::new(mtm, frame, &container, zoom);
     tv.setMinSize(NSSize::new(0.0, content_size.height));
     tv.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
     tv.setVerticallyResizable(true);
@@ -453,11 +636,25 @@ fn build_text_view(mtm: MainThreadMarker, scroll: &NSScrollView) -> Retained<NST
     tv.setAutomaticTextReplacementEnabled(false);
     tv.setAutomaticSpellingCorrectionEnabled(false);
     tv.setBackgroundColor(&NSColor::textBackgroundColor());
-    tv.setTextContainerInset(NSSize::new(16.0, 16.0));
+    // NSTextView's default link attributes add an underline on top of
+    // whatever the attributed string says. Colour + hand cursor is enough.
+    {
+        let keys: [&NSString; 2] =
+            unsafe { [NSForegroundColorAttributeName, NSCursorAttributeName] };
+        let link_color = NSColor::linkColor();
+        let cursor = NSCursor::pointingHandCursor();
+        let values: [&AnyObject; 2] = [
+            link_color.as_ref() as &AnyObject,
+            cursor.as_ref() as &AnyObject,
+        ];
+        let attrs = NSDictionary::from_slices(&keys, &values);
+        unsafe { tv.setLinkTextAttributes(Some(&attrs)) };
+    }
     if let Some(container) = unsafe { tv.textContainer() } {
         container.setContainerSize(NSSize::new(content_size.width, f64::MAX));
         container.setWidthTracksTextView(true);
     }
+    tv.update_inset();
     tv
 }
 
@@ -718,6 +915,74 @@ fn toggle_mode(id: WindowId) {
     });
 }
 
+fn zoom_by(id: WindowId, direction: i32) {
+    let Some(current) = with_window_mut(id, |s| s.zoom) else { return };
+    set_zoom(id, zoom_step(current, direction));
+}
+
+fn set_zoom(id: WindowId, zoom: f64) {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    with_window_mut(id, |state| {
+        if (state.zoom - zoom).abs() < 1e-6 {
+            return;
+        }
+        state.zoom = zoom;
+        save_zoom(zoom);
+        state.text_view.set_zoom(zoom);
+        let Some(doc) = state.doc.clone() else { return };
+        // Keep the reader's place: remember how far down we are as a
+        // fraction, rebuild both views at the new size, then restore.
+        let fraction = scroll_fraction(&state.text_view);
+        let bytes = doc.bytes.as_slice();
+        state.rendered = Some(rendered::build(mtm, bytes, &doc.output, zoom));
+        state.source = Some(source::build_with_parse(bytes, Some(&doc.output), zoom));
+        install_attributed(state);
+        set_scroll_fraction(&state.text_view, fraction);
+    });
+}
+
+fn scroll_fraction(tv: &MVTextView) -> f64 {
+    let Some(clip) = (unsafe { tv.superview() }) else { return 0.0 };
+    let visible = clip.bounds();
+    let doc_h = tv.frame().size.height;
+    let range = (doc_h - visible.size.height).max(0.0);
+    if range <= 0.0 {
+        0.0
+    } else {
+        (visible.origin.y / range).clamp(0.0, 1.0)
+    }
+}
+
+fn set_scroll_fraction(tv: &MVTextView, fraction: f64) {
+    let Some(clip) = (unsafe { tv.superview() }) else { return };
+    // Force layout so the frame height reflects the new content.
+    if let Some(lm) = unsafe { tv.layoutManager() } {
+        if let Some(container) = unsafe { tv.textContainer() } {
+            lm.ensureLayoutForTextContainer(&container);
+        }
+    }
+    let visible = clip.bounds();
+    let doc_h = tv.frame().size.height;
+    let range = (doc_h - visible.size.height).max(0.0);
+    let y = (range * fraction).floor();
+    clip.setBoundsOrigin(NSPoint::new(0.0, y));
+    if let Some(scroll) = clip.enclosingScrollView() {
+        scroll.reflectScrolledClipView(&scroll.contentView());
+    }
+}
+
+/// Swap the active mode's attributed string into the text storage
+/// without touching scroll position.
+fn install_attributed(state: &mut app_state::WindowState) {
+    let attr: Option<&NSAttributedString> = match state.mode {
+        Mode::Rendered => state.rendered.as_deref(),
+        Mode::Source => state.source.as_deref(),
+    };
+    if let (Some(attr), Some(ts)) = (attr, unsafe { state.text_view.textStorage() }) {
+        ts.setAttributedString(attr);
+    }
+}
+
 fn install_active_mode(state: &mut app_state::WindowState) {
     let attr: Option<&NSAttributedString> = match state.mode {
         Mode::Rendered => state.rendered.as_deref(),
@@ -840,8 +1105,9 @@ fn tick_progress_bars() {
 fn on_document_ready(id: WindowId, doc: Arc<Document>, path: &str) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let bytes = doc.bytes.as_slice();
-    let rendered = rendered::build(mtm, bytes, &doc.output);
-    let source = source::build_with_parse(bytes, Some(&doc.output));
+    let zoom = with_window_mut(id, |s| s.zoom).unwrap_or(1.0);
+    let rendered = rendered::build(mtm, bytes, &doc.output, zoom);
+    let source = source::build_with_parse(bytes, Some(&doc.output), zoom);
     with_window_mut(id, |state| {
         state.doc = Some(doc.clone());
         state.rendered = Some(rendered);

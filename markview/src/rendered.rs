@@ -19,9 +19,11 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSBackgroundColorAttributeName, NSColor, NSFont, NSFontAttributeName, NSFontManager,
-    NSFontTraitMask, NSForegroundColorAttributeName, NSLinkAttributeName,
-    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSTextAlignment, NSTextBlock,
-    NSTextBlockLayer, NSTextBlockValueType, NSTextTable, NSTextTableBlock,
+    NSFontTraitMask, NSFontWeightBold, NSFontWeightRegular, NSFontWeightSemibold,
+    NSForegroundColorAttributeName, NSLinkAttributeName, NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName, NSTextAlignment, NSTextBlock, NSTextBlockDimension,
+    NSTextBlockLayer,
+    NSTextBlockValueType, NSTextTab, NSTextTabType, NSTextTable, NSTextTableBlock,
     NSTextTableLayoutAlgorithm, NSUnderlineStyle, NSUnderlineStyleAttributeName,
 };
 use objc2_foundation::{
@@ -29,26 +31,39 @@ use objc2_foundation::{
     NSString,
 };
 
-const BODY_SIZE: f64 = 14.0;
+/// Base sizes at zoom 1.0. Everything below is multiplied by the
+/// caller-supplied `scale` so ⌘+/⌘− reflow the whole document rather
+/// than bitmap-magnifying it.
+const BODY_SIZE: f64 = 15.0;
 const MONO_SIZE: f64 = 13.0;
 
-/// Paragraph-style geometry. Kept in one place so the rendered output
-/// stays consistent across block kinds.
-const BLOCK_SPACING: f64 = 8.0;
-const HEADING_SPACING_BEFORE: f64 = 16.0;
-const HEADING_SPACING_AFTER: f64 = 6.0;
-const LIST_INDENT: f64 = 24.0;
-const QUOTE_INDENT: f64 = 16.0;
-const PRE_INDENT: f64 = 12.0;
+/// Line height as a multiple of the font's natural height. Body text
+/// gets a generous measure; code stays tighter so blocks read as one.
+const BODY_LINE_HEIGHT: f64 = 1.35;
+const CODE_LINE_HEIGHT: f64 = 1.25;
+
+/// Paragraph-style geometry (at zoom 1.0). Kept in one place so the
+/// rendered output stays consistent across block kinds.
+const BLOCK_SPACING: f64 = 12.0;
+const HEADING_SPACING_BEFORE: f64 = 22.0;
+const HEADING_SPACING_AFTER: f64 = 8.0;
+const LIST_INDENT: f64 = 26.0;
+const LIST_NEST_INDENT: f64 = 22.0;
+const LIST_ITEM_SPACING: f64 = 3.0;
+const QUOTE_INDENT: f64 = 14.0;
+const QUOTE_RULE_WIDTH: f64 = 3.0;
+const PRE_PADDING: f64 = 10.0;
+const HR_SPACING: f64 = 16.0;
 
 pub fn build(
     mtm: MainThreadMarker,
     bytes: &[u8],
     parse: &ParseOutput,
+    scale: f64,
 ) -> Retained<NSAttributedString> {
     let s = std::str::from_utf8(bytes).unwrap_or("");
     let lines = slice_lines(s, parse);
-    let b = Builder::new(mtm);
+    let b = Builder::new(mtm, scale);
 
     let mut i = 0;
     while i < parse.blocks.len() {
@@ -62,10 +77,31 @@ pub fn build(
                 b.emit_heading(line, level);
             }
             BlockKind::Paragraph => {
-                b.emit_paragraph(line);
+                // Consecutive source lines are one markdown paragraph:
+                // reflow them as a single paragraph so the text wraps
+                // to the column instead of to the author's editor.
+                let end = run_end(parse.blocks.as_slice(), i, |k| {
+                    matches!(k, BlockKind::Paragraph)
+                });
+                let joined = join_soft_lines((i..end).map(|k| {
+                    let li = parse.blocks[k].line_index as usize;
+                    lines.get(li).copied().unwrap_or("")
+                }));
+                b.emit_paragraph(&joined);
+                i = end;
+                continue;
             }
             BlockKind::BlockquoteLine => {
-                b.emit_blockquote(line);
+                let end = run_end(parse.blocks.as_slice(), i, |k| {
+                    matches!(k, BlockKind::BlockquoteLine)
+                });
+                let joined = join_soft_lines((i..end).map(|k| {
+                    let li = parse.blocks[k].line_index as usize;
+                    strip_blockquote(lines.get(li).copied().unwrap_or(""))
+                }));
+                b.emit_blockquote(&joined);
+                i = end;
+                continue;
             }
             BlockKind::ListItem {
                 ordered,
@@ -111,6 +147,31 @@ pub fn build(
     Retained::into_super(b.out)
 }
 
+/// Join the lines of one logical paragraph. A soft break becomes a
+/// space; a markdown hard break (two-plus trailing spaces or a trailing
+/// backslash) becomes U+2028 LINE SEPARATOR, which `NSTextView` renders
+/// as a line break inside the same paragraph.
+fn join_soft_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    let mut pending_break: Option<char> = None;
+    for line in lines {
+        let trimmed_end = line.trim_end();
+        let content = trimmed_end.trim_start();
+        if let Some(sep) = pending_break.take() {
+            out.push(sep);
+        }
+        let hard = line.len() - trimmed_end.len() >= 2 || content.ends_with('\\');
+        let content = if content.ends_with('\\') {
+            &content[..content.len() - 1]
+        } else {
+            content
+        };
+        out.push_str(content);
+        pending_break = Some(if hard { '\u{2028}' } else { ' ' });
+    }
+    out
+}
+
 fn run_end(blocks: &[BlockLine], start: usize, mut matches_kind: impl FnMut(BlockKind) -> bool) -> usize {
     let mut j = start;
     while j < blocks.len() && matches_kind(blocks[j].kind) {
@@ -146,6 +207,7 @@ fn slice_lines<'a>(s: &'a str, parse: &ParseOutput) -> Vec<&'a str> {
 
 struct Builder {
     out: Retained<NSMutableAttributedString>,
+    scale: f64,
     body_font: Retained<NSFont>,
     mono_font: Retained<NSFont>,
     italic_font: Retained<NSFont>,
@@ -162,11 +224,14 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(mtm: MainThreadMarker) -> Self {
-        let body_font = NSFont::systemFontOfSize(BODY_SIZE);
-        let bold_font = NSFont::boldSystemFontOfSize(BODY_SIZE);
-        let mono_font = NSFont::userFixedPitchFontOfSize(MONO_SIZE)
-            .expect("user fixed-pitch font is always available");
+    fn new(mtm: MainThreadMarker, scale: f64) -> Self {
+        let body_font = NSFont::systemFontOfSize(BODY_SIZE * scale);
+        let bold_font = NSFont::systemFontOfSize_weight(BODY_SIZE * scale, unsafe {
+            NSFontWeightSemibold
+        });
+        let mono_font = NSFont::monospacedSystemFontOfSize_weight(MONO_SIZE * scale, unsafe {
+            NSFontWeightRegular
+        });
         let manager = NSFontManager::sharedFontManager(mtm);
         let italic_font =
             manager.convertFont_toHaveTrait(&body_font, NSFontTraitMask::ItalicFontMask);
@@ -177,6 +242,7 @@ impl Builder {
 
         Self {
             out,
+            scale,
             body_font,
             mono_font,
             italic_font,
@@ -184,9 +250,11 @@ impl Builder {
             bold_italic_font,
             text_color: NSColor::textColor(),
             secondary_color: NSColor::secondaryLabelColor(),
-            code_bg: NSColor::colorWithCalibratedRed_green_blue_alpha(0.50, 0.50, 0.50, 0.18),
+            code_bg: NSColor::colorWithCalibratedRed_green_blue_alpha(0.50, 0.50, 0.50, 0.16),
             pre_bg: NSColor::colorWithCalibratedRed_green_blue_alpha(0.50, 0.50, 0.50, 0.10),
-            quote_rule_color: NSColor::tertiaryLabelColor(),
+            quote_rule_color: NSColor::colorWithCalibratedRed_green_blue_alpha(
+                0.50, 0.50, 0.50, 0.55,
+            ),
             link_color: NSColor::linkColor(),
             table_border_color: NSColor::colorWithCalibratedRed_green_blue_alpha(
                 0.50, 0.50, 0.50, 0.45,
@@ -195,6 +263,41 @@ impl Builder {
                 0.50, 0.50, 0.50, 0.15,
             ),
         }
+    }
+
+    /// Scale a zoom-1.0 length to the current zoom.
+    fn sz(&self, v: f64) -> f64 {
+        v * self.scale
+    }
+
+    fn pstyle(
+        &self,
+        first_indent: f64,
+        head_indent: f64,
+        spacing_before: f64,
+        spacing_after: f64,
+    ) -> Retained<NSMutableParagraphStyle> {
+        let p = paragraph_style(
+            self.sz(first_indent),
+            self.sz(head_indent),
+            self.sz(spacing_before),
+            self.sz(spacing_after),
+        );
+        p.setLineHeightMultiple(BODY_LINE_HEIGHT);
+        p
+    }
+
+    /// A standalone (non-table) `NSTextBlock` spanning the full column.
+    /// Without an explicit width a bare block shrinks to its content and
+    /// wraps one glyph per line.
+    fn full_width_block(&self) -> Retained<NSTextBlock> {
+        let block = NSTextBlock::new();
+        block.setValue_type_forDimension(
+            100.0,
+            NSTextBlockValueType::PercentageValueType,
+            NSTextBlockDimension::Width,
+        );
+        block
     }
 
     fn append(&self, text: &str, attrs: &NSDictionary<NSString>) {
@@ -221,9 +324,18 @@ impl Builder {
 
     fn emit_heading(&self, raw: &str, level: u32) {
         let stripped = strip_heading(raw);
-        let size = heading_font_size(level);
-        let font = NSFont::boldSystemFontOfSize(size);
-        let pstyle = paragraph_style(0.0, 0.0, HEADING_SPACING_BEFORE, HEADING_SPACING_AFTER);
+        let size = heading_font_size(level) * self.scale;
+        let weight = if level <= 2 {
+            unsafe { NSFontWeightBold }
+        } else {
+            unsafe { NSFontWeightSemibold }
+        };
+        let font = NSFont::systemFontOfSize_weight(size, weight);
+        // Top-level headings get a little more air above; deeper ones
+        // sit closer to the paragraph they introduce.
+        let before = if level <= 2 { HEADING_SPACING_BEFORE * 1.2 } else { HEADING_SPACING_BEFORE };
+        let pstyle = self.pstyle(0.0, 0.0, before, HEADING_SPACING_AFTER);
+        pstyle.setLineHeightMultiple(1.15);
         let attrs = attrs_for(&[
             (unsafe { NSFontAttributeName }, &*font),
             (unsafe { NSForegroundColorAttributeName }, &*self.text_color),
@@ -234,7 +346,7 @@ impl Builder {
     }
 
     fn emit_paragraph(&self, raw: &str) {
-        let pstyle = paragraph_style(0.0, 0.0, 0.0, BLOCK_SPACING);
+        let pstyle = self.pstyle(0.0, 0.0, 0.0, BLOCK_SPACING);
         self.render_inline(raw, &pstyle, BaseStyle::Body);
         let trailing_attrs = attrs_for(&[
             (unsafe { NSFontAttributeName }, &*self.body_font),
@@ -243,13 +355,29 @@ impl Builder {
         self.append("\n", &trailing_attrs);
     }
 
-    fn emit_blockquote(&self, raw: &str) {
-        // `> ` (or `>`) prefix stripped; render remainder as italic with indent.
-        let stripped = strip_blockquote(raw);
-        let pstyle = paragraph_style(QUOTE_INDENT, QUOTE_INDENT, 0.0, BLOCK_SPACING);
-        self.render_inline(stripped, &pstyle, BaseStyle::QuoteItalic);
+    fn emit_blockquote(&self, stripped: &str) {
+        // `> ` prefixes already stripped and lines joined by the caller;
+        // render in muted text behind a left rule drawn as an
+        // `NSTextBlock` border.
+        let pstyle = self.pstyle(0.0, 0.0, 2.0, BLOCK_SPACING);
+        let block = self.full_width_block();
+        block.setWidth_type_forLayer_edge(
+            self.sz(QUOTE_RULE_WIDTH),
+            NSTextBlockValueType::AbsoluteValueType,
+            NSTextBlockLayer::Border,
+            NSRectEdge::MinX,
+        );
+        block.setWidth_type_forLayer_edge(
+            self.sz(QUOTE_INDENT),
+            NSTextBlockValueType::AbsoluteValueType,
+            NSTextBlockLayer::Padding,
+            NSRectEdge::MinX,
+        );
+        block.setBorderColor(Some(&self.quote_rule_color));
+        pstyle.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        self.render_inline(stripped, &pstyle, BaseStyle::Quote);
         let trailing_attrs = attrs_for(&[
-            (unsafe { NSFontAttributeName }, &*self.italic_font),
+            (unsafe { NSFontAttributeName }, &*self.body_font),
             (unsafe { NSForegroundColorAttributeName }, &*self.secondary_color),
             (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
         ]);
@@ -257,18 +385,40 @@ impl Builder {
     }
 
     fn emit_list_item(&self, raw: &str, ordered: bool, marker_len: usize) {
-        let body = raw.get(marker_len..).unwrap_or("").trim_start();
+        // Nesting depth from leading whitespace (2 or 4 spaces per level
+        // both land on the same visual step; tabs count as one level).
+        let leading = raw.len() - raw.trim_start().len();
+        let depth = if leading == 0 {
+            0
+        } else {
+            let tabs = raw[..leading].matches('\t').count();
+            let spaces = leading - tabs;
+            (tabs + (spaces + 1) / 3).max(1)
+        } as f64;
+        let trimmed = raw.trim_start();
+        let marker_end = marker_len.saturating_sub(leading).min(trimmed.len());
+        let body = trimmed.get(marker_end..).unwrap_or("").trim_start();
         let prefix = if ordered {
             // Preserve the numeric marker as given.
-            let raw_marker: String = raw.chars().take_while(|c| !c.is_whitespace()).collect();
-            format!("{} ", raw_marker)
+            let raw_marker: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
+            format!("{}\t", raw_marker)
         } else {
-            "• ".to_string()
+            "•\t".to_string()
         };
-        let pstyle = paragraph_style(LIST_INDENT, LIST_INDENT, 0.0, 2.0);
+        // Hanging indent: marker sits in the gutter, body text (and any
+        // wrapped continuation) aligns at `text_x` via a tab stop.
+        let gutter = depth * LIST_NEST_INDENT;
+        let text_x = gutter + LIST_INDENT;
+        let pstyle = self.pstyle(gutter + 4.0, text_x, 0.0, LIST_ITEM_SPACING);
+        let tab = NSTextTab::initWithType_location(
+            NSTextTab::alloc(),
+            NSTextTabType::LeftTabStopType,
+            self.sz(text_x),
+        );
+        pstyle.setTabStops(Some(&NSArray::from_retained_slice(&[tab])));
         let prefix_attrs = attrs_for(&[
             (unsafe { NSFontAttributeName }, &*self.body_font),
-            (unsafe { NSForegroundColorAttributeName }, &*self.secondary_color),
+            (unsafe { NSForegroundColorAttributeName }, &*self.text_color),
             (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
         ]);
         self.append(&prefix, &prefix_attrs);
@@ -281,13 +431,25 @@ impl Builder {
     }
 
     fn emit_hr(&self) {
-        let pstyle = paragraph_style(0.0, 0.0, BLOCK_SPACING, BLOCK_SPACING);
+        // A near-empty paragraph whose text block draws a hairline top
+        // border — a real full-width rule, not a row of glyphs.
+        let pstyle = self.pstyle(0.0, 0.0, HR_SPACING, HR_SPACING);
+        pstyle.setLineHeightMultiple(1.0);
+        let block = self.full_width_block();
+        block.setWidth_type_forLayer_edge(
+            1.0,
+            NSTextBlockValueType::AbsoluteValueType,
+            NSTextBlockLayer::Border,
+            NSRectEdge::MinY,
+        );
+        block.setBorderColor(Some(&self.quote_rule_color));
+        pstyle.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        let tiny = NSFont::systemFontOfSize(1.0);
         let attrs = attrs_for(&[
-            (unsafe { NSFontAttributeName }, &*self.body_font),
-            (unsafe { NSForegroundColorAttributeName }, &*self.quote_rule_color),
+            (unsafe { NSFontAttributeName }, &*tiny),
             (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
         ]);
-        self.append("──────────────────────────────────────\n", &attrs);
+        self.append("\n", &attrs);
     }
 
     fn emit_fenced_code(&self, lines: &[&str]) {
@@ -409,7 +571,7 @@ impl Builder {
                 NSRectEdge::MaxY,
             );
             block.setWidth_type_forLayer(
-                6.0,
+                self.sz(7.0),
                 NSTextBlockValueType::AbsoluteValueType,
                 NSTextBlockLayer::Padding,
             );
@@ -423,6 +585,7 @@ impl Builder {
             // Tight vertical rhythm inside cells.
             pstyle.setParagraphSpacing(0.0);
             pstyle.setParagraphSpacingBefore(0.0);
+            pstyle.setLineHeightMultiple(1.25);
             let super_block: Retained<NSTextBlock> = Retained::into_super(block);
             let blocks_array = NSArray::from_retained_slice(&[super_block]);
             pstyle.setTextBlocks(&blocks_array);
@@ -443,25 +606,32 @@ impl Builder {
     }
 
     fn emit_pre_block(&self, lines: &[&str]) {
-        // One paragraph per line so a long block can wrap-or-not by
-        // line. Spacing only on the last line for visual grouping.
-        let last = lines.len().saturating_sub(1);
-        for (i, line) in lines.iter().enumerate() {
-            let spacing_after = if i == last { BLOCK_SPACING } else { 0.0 };
-            let pstyle = paragraph_style(PRE_INDENT, PRE_INDENT, 0.0, spacing_after);
-            let attrs = attrs_for(&[
-                (unsafe { NSFontAttributeName }, &*self.mono_font),
-                (unsafe { NSForegroundColorAttributeName }, &*self.text_color),
-                (unsafe { NSBackgroundColorAttributeName }, &*self.pre_bg),
-                (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
-            ]);
-            // Pad the line with a trailing space so the background
-            // colour extends a touch past short lines, matching how
-            // people expect `<pre>` to look.
-            let padded = format!("{} ", line);
-            self.append(&padded, &attrs);
-            self.append("\n", &attrs);
-        }
+        // The whole block is ONE paragraph: lines joined by U+2028 LINE
+        // SEPARATOR so a single `NSTextBlock` paints one flush background
+        // rectangle (per-line paragraphs leave hairline seams between
+        // their backgrounds). `MVTextView` turns U+2028 back into `\n`
+        // on copy so pasted code is unchanged.
+        let pstyle = self.pstyle(0.0, 0.0, 0.0, BLOCK_SPACING);
+        let line_h = (MONO_SIZE * self.scale * CODE_LINE_HEIGHT * 1.2).round();
+        pstyle.setLineHeightMultiple(1.0);
+        pstyle.setMinimumLineHeight(line_h);
+        pstyle.setMaximumLineHeight(line_h);
+        let block = self.full_width_block();
+        block.setWidth_type_forLayer(
+            self.sz(PRE_PADDING),
+            NSTextBlockValueType::AbsoluteValueType,
+            NSTextBlockLayer::Padding,
+        );
+        block.setBackgroundColor(Some(&self.pre_bg));
+        pstyle.setTextBlocks(&NSArray::from_retained_slice(&[block]));
+        let attrs = attrs_for(&[
+            (unsafe { NSFontAttributeName }, &*self.mono_font),
+            (unsafe { NSForegroundColorAttributeName }, &*self.text_color),
+            (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
+        ]);
+        let joined = lines.join("\u{2028}");
+        self.append(&joined, &attrs);
+        self.append("\n", &attrs);
     }
 
     // -- inline parser ----------------------------------------------
@@ -543,7 +713,7 @@ impl Builder {
 #[derive(Clone, Copy, PartialEq)]
 enum BaseStyle {
     Body,
-    QuoteItalic,
+    Quote,
     HeaderCell,
 }
 
@@ -558,8 +728,8 @@ fn base_attrs(
             (unsafe { NSForegroundColorAttributeName }, &*b.text_color),
             (unsafe { NSParagraphStyleAttributeName }, pstyle),
         ]),
-        BaseStyle::QuoteItalic => attrs_for(&[
-            (unsafe { NSFontAttributeName }, &*b.italic_font),
+        BaseStyle::Quote => attrs_for(&[
+            (unsafe { NSFontAttributeName }, &*b.body_font),
             (unsafe { NSForegroundColorAttributeName }, &*b.secondary_color),
             (unsafe { NSParagraphStyleAttributeName }, pstyle),
         ]),
@@ -589,12 +759,11 @@ fn bold_attrs(
     base: BaseStyle,
 ) -> Retained<NSDictionary<NSString>> {
     let font: &NSFont = match base {
-        BaseStyle::Body | BaseStyle::HeaderCell => &b.bold_font,
-        BaseStyle::QuoteItalic => &b.bold_italic_font,
+        BaseStyle::Body | BaseStyle::HeaderCell | BaseStyle::Quote => &b.bold_font,
     };
     let color: &NSColor = match base {
         BaseStyle::Body | BaseStyle::HeaderCell => &b.text_color,
-        BaseStyle::QuoteItalic => &b.secondary_color,
+        BaseStyle::Quote => &b.secondary_color,
     };
     attrs_for(&[
         (unsafe { NSFontAttributeName }, font),
@@ -609,13 +778,12 @@ fn italic_attrs(
     base: BaseStyle,
 ) -> Retained<NSDictionary<NSString>> {
     let font: &NSFont = match base {
-        BaseStyle::Body => &b.italic_font,
-        BaseStyle::QuoteItalic => &b.italic_font, // already italic; keep
+        BaseStyle::Body | BaseStyle::Quote => &b.italic_font,
         BaseStyle::HeaderCell => &b.bold_italic_font,
     };
     let color: &NSColor = match base {
         BaseStyle::Body | BaseStyle::HeaderCell => &b.text_color,
-        BaseStyle::QuoteItalic => &b.secondary_color,
+        BaseStyle::Quote => &b.secondary_color,
     };
     attrs_for(&[
         (unsafe { NSFontAttributeName }, font),
@@ -633,7 +801,7 @@ fn link_attrs(
     // works just as well as an NSURL for that, and avoids dealing with
     // URL-parse failures here.
     let url_ns = NSString::from_str(url);
-    let underline = NSNumber::new_isize(NSUnderlineStyle::Single.0 as isize);
+    let no_underline = NSNumber::new_isize(NSUnderlineStyle::None.0 as isize);
     let keys: [&NSString; 5] = unsafe {
         [
             NSFontAttributeName,
@@ -648,7 +816,7 @@ fn link_attrs(
         b.link_color.as_ref() as &AnyObject,
         pstyle as &NSMutableParagraphStyle as &AnyObject,
         url_ns.as_ref() as &AnyObject,
-        underline.as_ref() as &AnyObject,
+        no_underline.as_ref() as &AnyObject,
     ];
     NSDictionary::from_slices(&keys, &values)
 }
@@ -686,12 +854,12 @@ fn ns_alignment(a: CellAlign) -> NSTextAlignment {
 
 fn heading_font_size(level: u32) -> f64 {
     match level {
-        1 => 26.0,
-        2 => 22.0,
-        3 => 18.0,
-        4 => 16.0,
-        5 => 14.0,
-        _ => 13.0,
+        1 => 30.0,
+        2 => 23.0,
+        3 => 19.0,
+        4 => 17.0,
+        5 => 15.5,
+        _ => 15.0,
     }
 }
 
