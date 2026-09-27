@@ -208,6 +208,9 @@ mod app_state {
         pub source: Option<Retained<NSAttributedString>>,
         pub mode: Mode,
         pub zoom: f64,
+        /// Set by Reload: the mode and scroll fraction to put back
+        /// when the re-read document lands.
+        pub reload_restore: Option<(Mode, f64)>,
     }
 
     thread_local! {
@@ -331,6 +334,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(mvReload:))]
+        fn mv_reload(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                reload_file(id);
+            }
+        }
+
         #[unsafe(method(mvZoomIn:))]
         fn mv_zoom_in(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
@@ -447,6 +457,14 @@ fn install_menu_bar(mtm: MainThreadMarker) {
         "Paste from Clipboard",
         objc2::sel!(mvPaste:),
         "v",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+    );
+    add_menu_item(
+        mtm,
+        &view_menu,
+        "Reload from Disk",
+        objc2::sel!(mvReload:),
+        "r",
         NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     );
     add_menu_item(
@@ -592,6 +610,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         source: None,
         mode: Mode::Rendered,
         zoom,
+        reload_restore: None,
     };
     app_state::WINDOWS.with(|m| {
         m.borrow_mut().insert(id, state);
@@ -687,6 +706,16 @@ fn build_header_bar(mtm: MainThreadMarker, target: &AnyObject) -> HeaderBar {
     set_key(&clear_button, "k", cmd);
     clear_button.setToolTip(Some(&NSString::from_str("Clear document  ⌘K")));
 
+    let reload_button = make_icon_button(
+        mtm,
+        "arrow.clockwise",
+        "Reload from disk",
+        target,
+        objc2::sel!(mvReload:),
+    );
+    set_key(&reload_button, "r", cmd.union(NSEventModifierFlags::Shift));
+    reload_button.setToolTip(Some(&NSString::from_str("Reload file from disk  ⇧⌘R")));
+
     let toggle_button = make_button(mtm, "Source", target, objc2::sel!(mvToggleMode:));
     set_key(&toggle_button, "r", cmd);
     toggle_button.setToolTip(Some(&NSString::from_str(
@@ -725,6 +754,7 @@ fn build_header_bar(mtm: MainThreadMarker, target: &AnyObject) -> HeaderBar {
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
         &*paste_button as &NSView,
         &*clear_button as &NSView,
+        &*reload_button as &NSView,
         &*spacer as &NSView,
         &*progress_bar as &NSView,
         &*toggle_button as &NSView,
@@ -843,6 +873,7 @@ fn clear_view(id: WindowId) {
         state.rendered = None;
         state.source = None;
         state.current_path = None;
+        state.reload_restore = None;
         state.mode = Mode::Rendered;
         let empty = NSAttributedString::new();
         if let Some(ts) = unsafe { state.text_view.textStorage() } {
@@ -874,6 +905,7 @@ fn paste_from_clipboard(id: WindowId) {
         state.rendered = None;
         state.source = None;
         state.current_path = Some(label.clone());
+        state.reload_restore = None;
         state
             .window
             .setTitle(&NSString::from_str("Markview — parsing clipboard…"));
@@ -891,6 +923,7 @@ fn load_file_into_window(id: WindowId, path: &str) {
         state.rendered = None;
         state.source = None;
         state.current_path = Some(path.to_string());
+        state.reload_restore = None;
         state.window.setTitle(&NSString::from_str(&format!(
             "Markview — loading {}…",
             name
@@ -900,6 +933,22 @@ fn load_file_into_window(id: WindowId, path: &str) {
     app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     worker::spawn_load(id, path.to_string(), tx);
     ensure_poll_timer();
+}
+
+/// Re-read the tab's file from disk, keeping the view mode and how far
+/// down the reader was. No-op for clipboard documents or mid-load.
+fn reload_file(id: WindowId) {
+    let pending = with_window_mut(id, |state| {
+        let path = state.current_path.clone().filter(|p| p != "<clipboard>")?;
+        if state.progress.is_some() {
+            return None;
+        }
+        Some((path, (state.mode, scroll_fraction(&state.text_view))))
+    })
+    .flatten();
+    let Some((path, restore)) = pending else { return };
+    load_file_into_window(id, &path);
+    with_window_mut(id, |state| state.reload_restore = Some(restore));
 }
 
 fn toggle_mode(id: WindowId) {
@@ -1059,6 +1108,7 @@ fn drain_worker() {
                 eprintln!("markview: {}", message);
                 with_window_mut(window_id, |state| {
                     state.window.setTitle(&NSString::from_str("Markview"));
+                    state.reload_restore = None;
                     hide_progress(state);
                 });
                 app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1112,13 +1162,17 @@ fn on_document_ready(id: WindowId, doc: Arc<Document>, path: &str) {
         state.doc = Some(doc.clone());
         state.rendered = Some(rendered);
         state.source = Some(source);
-        state.mode = Mode::Rendered;
+        let restore = state.reload_restore.take();
+        state.mode = restore.map_or(Mode::Rendered, |(mode, _)| mode);
         state.current_path = Some(path.to_string());
         let name = basename(path);
         state
             .window
             .setTitle(&NSString::from_str(&format!("Markview — {}", name)));
         install_active_mode(state);
+        if let Some((_, fraction)) = restore {
+            set_scroll_fraction(&state.text_view, fraction);
+        }
         hide_progress(state);
     });
     let _ = id;
@@ -1164,6 +1218,22 @@ fn main() {
 
     if std::env::args().any(|a| a == "--selftest-launch") {
         app_state::SELFTEST_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // AppKit synthesizes application:openFile: events from unknown argv
+    // arguments, and applicationDidFinishLaunching walks argv itself —
+    // so a CLI launch would load every file twice, into two tabs.
+    // Registering NSTreatUnknownArgumentsAsOpen=NO turns the synthesis
+    // off; Finder/`open` launches still arrive via application:openURLs:.
+    {
+        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("NSTreatUnknownArgumentsAsOpen");
+        let value = NSString::from_str("NO");
+        let dict = objc2_foundation::NSDictionary::from_slices(
+            &[&*key],
+            &[value.as_ref() as &AnyObject],
+        );
+        unsafe { defaults.registerDefaults(&dict) };
     }
 
     let mtm = MainThreadMarker::new().expect("must run on main thread");

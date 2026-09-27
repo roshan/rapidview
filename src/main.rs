@@ -96,6 +96,17 @@ mod app_state {
         pub pretty_pending: bool,
         pub saved_original: SavedViewport,
         pub saved_pretty: SavedViewport,
+        /// Set by Reload: where the reader was, re-applied when the
+        /// fresh document lands (first snapshot or DocumentReady).
+        pub reload_restore: Option<ReloadRestore>,
+    }
+
+    /// View state carried across a Reload so the file comes back where
+    /// the reader left it rather than at the top.
+    pub struct ReloadRestore {
+        pub viewport: SavedViewport,
+        pub csv_table: bool,
+        pub was_pretty: bool,
     }
 
     impl WindowState {
@@ -253,6 +264,13 @@ define_class!(
         fn rv_clear_document(&self, sender: &AnyObject) {
             if let Some(id) = window_id_from_sender(sender) {
                 clear_view(id);
+            }
+        }
+
+        #[unsafe(method(rvReload:))]
+        fn rv_reload(&self, sender: &AnyObject) {
+            if let Some(id) = window_id_from_sender(sender) {
+                reload_file(id);
             }
         }
 
@@ -469,6 +487,14 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     add_menu_item(
         mtm,
         &view_menu,
+        "Reload from Disk",
+        objc2::sel!(rvReload:),
+        "r",
+        NSEventModifierFlags::Command,
+    );
+    add_menu_item(
+        mtm,
+        &view_menu,
         "Clear Document",
         objc2::sel!(rvClearDocument:),
         "k",
@@ -638,6 +664,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         pretty_pending: false,
         saved_original: app_state::SavedViewport::default(),
         saved_pretty: app_state::SavedViewport::default(),
+        reload_restore: None,
     };
     app_state::WINDOWS.with(|m| {
         m.borrow_mut().insert(id, state);
@@ -670,6 +697,10 @@ fn build_header_bar(
         make_icon_button(mtm, "xmark.circle", "Clear document", target, objc2::sel!(rvClearDocument:));
     set_key(&clear_button, "k", cmd);
     clear_button.setToolTip(Some(&NSString::from_str("Clear document  ⌘K")));
+    let reload_button =
+        make_icon_button(mtm, "arrow.clockwise", "Reload from disk", target, objc2::sel!(rvReload:));
+    set_key(&reload_button, "r", cmd);
+    reload_button.setToolTip(Some(&NSString::from_str("Reload file from disk  ⌘R")));
     let prettify_button = make_button_underlined(mtm, "Prettify", 'P', target, objc2::sel!(rvTogglePrettify:));
     set_key(&prettify_button, "p", cmd);
     prettify_button.setToolTip(Some(&NSString::from_str("Toggle pretty-print (⌘P)")));
@@ -709,6 +740,7 @@ fn build_header_bar(
     let header_views: Retained<NSArray<NSView>> = NSArray::from_slice(&[
         &*clipboard_button as &NSView,
         &*clear_button as &NSView,
+        &*reload_button as &NSView,
         &*prettify_button as &NSView,
         &*label as &NSView,
         &*progress_bar as &NSView,
@@ -930,6 +962,7 @@ fn show_open_panel(mtm: MainThreadMarker, delegate: &AppDelegate) {
 fn clear_view(id: WindowId) {
     with_window_mut(id, |state| {
         state.reset_doc_state();
+        state.reload_restore = None;
         state.current_path = None;
         state.window.setTitle(&NSString::from_str("Rapid View"));
         state.doc_view.clear_document();
@@ -955,6 +988,7 @@ fn paste_from_clipboard(id: WindowId) {
     let label = "<clipboard>".to_string();
     with_window_mut(id, |state| {
         state.reset_doc_state();
+        state.reload_restore = None;
         state.current_path = Some(label.clone());
         state
             .window
@@ -971,6 +1005,7 @@ fn load_file_into_window(id: WindowId, path: &str) {
     let name = basename(path);
     with_window_mut(id, |state| {
         state.reset_doc_state();
+        state.reload_restore = None;
         state.current_path = Some(path.to_string());
         state
             .window
@@ -981,6 +1016,55 @@ fn load_file_into_window(id: WindowId, path: &str) {
     app_state::WORK_PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     worker::spawn_load(id, path.to_string(), tx);
     ensure_poll_timer();
+}
+
+/// Re-read the tab's file from disk, keeping scroll position, cursor,
+/// CSV table mode, and prettify state. No-op for clipboard documents
+/// or while a load is already in flight.
+fn reload_file(id: WindowId) {
+    let restore = with_window(id, |state| {
+        let path = state.current_path.clone().filter(|p| p != "<clipboard>")?;
+        if state.progress.is_some() {
+            return None;
+        }
+        let viewport = if state.is_pretty {
+            state.saved_original.clone()
+        } else {
+            save_viewport(state)
+        };
+        Some((
+            path,
+            app_state::ReloadRestore {
+                viewport,
+                csv_table: state.doc_view.csv_table_mode(),
+                was_pretty: state.is_pretty || state.pretty_pending,
+            },
+        ))
+    })
+    .flatten();
+    let Some((path, restore)) = restore else { return };
+    load_file_into_window(id, &path);
+    with_window_mut(id, |state| state.reload_restore = Some(restore));
+}
+
+/// Put a reloaded document back where the reader was. Returns true if
+/// the caller should re-run prettify (can't happen under the borrow).
+fn apply_reload_restore(
+    state: &mut app_state::WindowState,
+    restore: app_state::ReloadRestore,
+    doc_len: usize,
+) -> bool {
+    if !restore.csv_table && state.doc_view.csv_table_mode() {
+        state.doc_view.set_csv_table_mode(false);
+        set_underlined_title(&state.prettify_button, "Table", 'T');
+    }
+    let mut vp = restore.viewport;
+    // The file may have shrunk; a stale cursor past EOF would index
+    // out of bounds in the path formatter.
+    vp.click_offset = vp.click_offset.filter(|&o| (o as usize) < doc_len);
+    restore_viewport(state, &vp);
+    state.doc_view.refresh_path_display();
+    restore.was_pretty
 }
 
 fn copy_path_expression(id: WindowId) {
@@ -1327,6 +1411,7 @@ fn drain_worker() {
                 eprintln!("rapid-view: {}", message);
                 with_window_mut(window_id, |state| {
                     state.window.setTitle(&NSString::from_str("Rapid View"));
+                    state.reload_restore = None;
                     hide_progress(state);
                 });
                 app_state::WORK_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1383,11 +1468,12 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
     let lines = doc.line_count();
     let fmt = doc.format;
     eprintln!("loaded {} ({} bytes, {} lines, {:?})", path, size, lines, fmt);
-    with_window_mut(id, |state| {
+    let reprettify = with_window_mut(id, |state| {
         // The tail of a progressive load is a continuation of the doc
         // the user is already browsing — swap the complete index in
         // without resetting scroll, click, search, or view mode.
         let continuation = state.progressive_path.as_deref() == Some(path);
+        let restore = state.reload_restore.take();
         if !continuation {
             state.reset_doc_state();
         }
@@ -1398,7 +1484,11 @@ fn on_document_ready(id: WindowId, doc: std::sync::Arc<doc::Document>, path: &st
         refresh_format_chrome(state, fmt);
         refresh_title(state);
         hide_progress(state);
+        restore.is_some_and(|r| apply_reload_restore(state, r, size))
     });
+    if reprettify == Some(true) && !fmt.is_tabular() {
+        toggle_prettify(id);
+    }
 }
 
 /// A snapshot of a still-indexing CSV: install it so the file is
@@ -1411,15 +1501,23 @@ fn on_document_progress(id: WindowId, doc: std::sync::Arc<doc::Document>, path: 
         doc.line_count().saturating_sub(1)
     );
     with_window_mut(id, |state| {
-        if state.progressive_path.as_deref() != Some(path) {
+        let first = state.progressive_path.as_deref() != Some(path);
+        let restore = if first { state.reload_restore.take() } else { None };
+        if first {
             state.reset_doc_state();
             state.progressive_path = Some(path.to_string());
             state.current_path = Some(path.to_string());
             refresh_format_chrome(state, fmt);
             refresh_title(state);
         }
+        let len = doc.bytes.len();
         state.original_doc = Some(doc.clone());
         state.doc_view.set_document(doc);
+        if let Some(r) = restore {
+            // Progressive loads are CSV-only, so there's no prettify
+            // to re-run.
+            apply_reload_restore(state, r, len);
+        }
     });
 }
 

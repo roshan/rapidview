@@ -60,6 +60,13 @@ CSV keeps **no per-cell index** (RAPIDVIEW-2): the only per-row state is `line_s
 - **Bare (non-table) `NSTextBlock`s need an explicit 100% width**
   (`Builder::full_width_block`) or they shrink to one glyph per line.
   Blockquote rule, horizontal rule, and code background all use it.
+- **GFM task lists** (`- [ ]` / `- [x]`) render in `emit_list_item`
+  via `task_marker`: the box replaces the bullet (unordered) or
+  follows the number (ordered). Glyphs are pinned to Apple Symbols —
+  the system font's fallbacks for ☐ and ☑ differ wildly in size.
+- **Reload** (⇧⌘R — ⌘R is the Rendered/Source toggle; Rapid View uses
+  ⌘R) re-reads the file and restores mode + scroll fraction via
+  `WindowState.reload_restore`, consumed in `on_document_ready`.
 - Links get no underline: `linkTextAttributes` on the text view is set
   to colour + hand cursor only, because NSTextView's default overrides
   whatever the attributed string says.
@@ -72,6 +79,8 @@ CSV keeps **no per-cell index** (RAPIDVIEW-2): the only per-row state is `line_s
 - One worker thread per request. Worker emits `ParseStarted` first (carrying `Arc<ProgressSink>`), then exactly one terminal message: `DocumentReady`, `PrettyReady`, or `Error`. Large CSVs additionally emit non-terminal `DocumentProgress` snapshots in between. `WORK_PENDING` only decrements on terminal messages; the poll timer tears down when it hits zero.
 - Format auto-detection: `format::detect` looks at the first non-whitespace byte after a possible UTF-8 BOM. `<` → XML, else JSON. CSV/TSV are picked by **file extension only** (`detect_for_path`: `.csv` / `.tsv` / `.tab`) — never by content sniffing, so clipboard pastes can't become CSV (deliberate, per Roshan).
 - For CSV docs the Prettify button is a Table ↔ Original toggle (`DocView::set_csv_table_mode`) — a draw-flag flip, no worker round-trip, no second `Document`. `format::prettify` is never invoked for CSV.
+
+**Reload** (⌘R, `rvReload:`) re-runs `load_file_into_window` for the tab's path and stashes a `ReloadRestore` (viewport, CSV table mode, was-pretty) in `WindowState.reload_restore`; `on_document_ready` / the first `on_document_progress` snapshot consume it, and prettify is re-run if it was on.
 
 ## Build / test / deploy
 
@@ -99,7 +108,7 @@ mise run deploy-all                   # both apps in one go
 
 ## Selectors and chrome
 
-ObjC selectors on `RVAppDelegate`: `rvNewWindow:`, `rvOpenDocument:`, `rvTogglePrettify:`, `rvPaste:`, `rvClearDocument:`, `rvCopyPath:`, `rvCopySubtree:`, `rvShowSearch:`, `rvSearchNext:`, `rvSearchPrev:`, `rvDismissSearch:`, `rvSearchFieldAction:`, `rvSearchChanged:`, `rvWorkerTick:`.
+ObjC selectors on `RVAppDelegate`: `rvNewWindow:`, `rvOpenDocument:`, `rvTogglePrettify:`, `rvPaste:`, `rvClearDocument:`, `rvReload:`, `rvCopyPath:`, `rvCopySubtree:`, `rvShowSearch:`, `rvSearchNext:`, `rvSearchPrev:`, `rvDismissSearch:`, `rvSearchFieldAction:`, `rvSearchChanged:`, `rvWorkerTick:`.
 
 Toolbar buttons "Copy jq" / "Copy XPath" / "Copy xsv" and "Copy JSON" / "Copy XML" / "Copy CSV" have their titles updated by `refresh_format_chrome` when a document loads (which also sets the Prettify button to "Original" for CSV). CSV path expressions are xsv pipelines: cell → `xsv slice -i R | xsv select C`, header → `xsv select C`, root → `xsv table`.
 

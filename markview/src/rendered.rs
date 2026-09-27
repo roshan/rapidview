@@ -396,12 +396,22 @@ impl Builder {
             (tabs + (spaces + 1) / 3).max(1)
         } as f64;
         let trimmed = raw.trim_start();
-        let marker_end = marker_len.saturating_sub(leading).min(trimmed.len());
+        // `marker_len` is measured from the first non-space byte (the
+        // parser strips the indent first), so it indexes `trimmed`.
+        let marker_end = marker_len.min(trimmed.len());
         let body = trimmed.get(marker_end..).unwrap_or("").trim_start();
+        // GFM task list item: `- [ ] todo` / `- [x] done`.
+        let (task, body) = match task_marker(body) {
+            Some((checked, rest)) => (Some(checked), rest),
+            None => (None, body),
+        };
         let prefix = if ordered {
             // Preserve the numeric marker as given.
             let raw_marker: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
             format!("{}\t", raw_marker)
+        } else if task.is_some() {
+            // The checkbox replaces the bullet in the gutter.
+            String::new()
         } else {
             "•\t".to_string()
         };
@@ -422,6 +432,29 @@ impl Builder {
             (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
         ]);
         self.append(&prefix, &prefix_attrs);
+        if let Some(checked) = task {
+            let (glyph, color) = if checked {
+                ("☑", &*self.link_color)
+            } else {
+                ("☐", &*self.secondary_color)
+            };
+            // ☐ and ☑ fall back to different fonts (and sizes) from the
+            // system font; pin both to Apple Symbols so they match.
+            let box_font = NSFont::fontWithName_size(
+                &NSString::from_str("Apple Symbols"),
+                BODY_SIZE * 1.3 * self.scale,
+            )
+            .unwrap_or_else(|| self.body_font.clone());
+            let box_attrs = attrs_for(&[
+                (unsafe { NSFontAttributeName }, &*box_font),
+                (unsafe { NSForegroundColorAttributeName }, color),
+                (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
+            ]);
+            // Unordered: box sits in the gutter like a bullet. Ordered:
+            // after the number, inline with the body (as GitHub does).
+            let sep = if ordered { " " } else { "\t" };
+            self.append(&format!("{}{}", glyph, sep), &box_attrs);
+        }
         self.render_inline(body, &pstyle, BaseStyle::Body);
         let trailing_attrs = attrs_for(&[
             (unsafe { NSFontAttributeName }, &*self.body_font),
@@ -958,6 +991,26 @@ fn find_double_marker(bytes: &[u8], from: usize, target: u8) -> Option<usize> {
 /// Returns (text_end_excl, url_start, url_end_excl) on a `[text](url)`
 /// match starting at `i` (which points at `[`). Lazy: doesn't handle
 /// escaped brackets or balanced parens inside the URL.
+/// Split a GFM task-list marker (`[ ]`, `[x]`, `[X]`) off the front of
+/// a list item's body. The marker must be followed by whitespace or end
+/// the line; returns `(checked, rest_of_body)`.
+fn task_marker(body: &str) -> Option<(bool, &str)> {
+    let b = body.as_bytes();
+    if b.len() < 3 || b[0] != b'[' || b[2] != b']' {
+        return None;
+    }
+    let checked = match b[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    match b.get(3) {
+        None => Some((checked, "")),
+        Some(b' ' | b'\t') => Some((checked, body[3..].trim_start())),
+        Some(_) => None,
+    }
+}
+
 fn parse_link(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
     if bytes.get(i) != Some(&b'[') {
         return None;
@@ -984,4 +1037,22 @@ fn parse_link(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
         return None;
     }
     Some((text_end, url_start, m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_marker;
+
+    #[test]
+    fn task_markers() {
+        assert_eq!(task_marker("[ ] todo"), Some((false, "todo")));
+        assert_eq!(task_marker("[x] done"), Some((true, "done")));
+        assert_eq!(task_marker("[X]\tdone"), Some((true, "done")));
+        assert_eq!(task_marker("[x]"), Some((true, "")));
+        // Not tasks: link text, other letters, no gap after the box.
+        assert_eq!(task_marker("[link](url)"), None);
+        assert_eq!(task_marker("[y] nope"), None);
+        assert_eq!(task_marker("[x]nope"), None);
+        assert_eq!(task_marker("plain"), None);
+    }
 }
