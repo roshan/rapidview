@@ -130,6 +130,19 @@ define_class!(
             }
         }
 
+        /// A click on a task-list checkbox toggles it; everything else
+        /// (selection, links) goes to NSTextView as usual.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            if let Some(char_index) = self.task_box_at(event) {
+                if let Some(id) = window_id_from_sender(self) {
+                    toggle_task(id, char_index);
+                }
+                return;
+            }
+            let _: () = unsafe { msg_send![super(self), mouseDown: event] };
+        }
+
         /// Trackpad pinch → stepwise zoom. Accumulate the gesture's
         /// magnification and fire a step every ±0.12 so a single pinch
         /// walks a few stops rather than jumping to the extremes.
@@ -164,6 +177,37 @@ impl MVTextView {
         unsafe { msg_send![super(this), initWithFrame: frame, textContainer: container] }
     }
 
+    /// Character index of the task checkbox under the click, if any.
+    /// Hit-tests the glyph's own bounding box so clicks beside it (or on
+    /// the task text) still select text normally.
+    fn task_box_at(&self, event: &NSEvent) -> Option<usize> {
+        let lm = unsafe { self.layoutManager() }?;
+        let container = unsafe { self.textContainer() }?;
+        let storage = unsafe { self.textStorage() }?;
+        let p = self.convertPoint_fromView(event.locationInWindow(), None);
+        let origin = self.textContainerOrigin();
+        let p = NSPoint::new(p.x - origin.x, p.y - origin.y);
+        let glyph = lm.glyphIndexForPoint_inTextContainer(p, &container);
+        let rect = lm.boundingRectForGlyphRange_inTextContainer(
+            objc2_foundation::NSRange::new(glyph, 1),
+            &container,
+        );
+        let inside = p.x >= rect.origin.x
+            && p.x <= rect.origin.x + rect.size.width
+            && p.y >= rect.origin.y
+            && p.y <= rect.origin.y + rect.size.height;
+        if !inside {
+            return None;
+        }
+        let ci = lm.characterIndexForGlyphAtIndex(glyph);
+        if ci >= storage.length() {
+            return None;
+        }
+        let key = NSString::from_str(rendered::TASK_ATTR);
+        let v = unsafe { storage.attribute_atIndex_effectiveRange(&key, ci, std::ptr::null_mut()) };
+        v.map(|_| ci)
+    }
+
     fn set_zoom(&self, zoom: f64) {
         self.ivars().zoom.set(zoom);
         self.update_inset();
@@ -192,7 +236,7 @@ mod app_state {
     use objc2_app_kit::{NSButton, NSProgressIndicator, NSWindow};
     use objc2_foundation::{NSAttributedString, NSTimer};
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32};
 
@@ -211,6 +255,9 @@ mod app_state {
         /// Set by Reload: the mode and scroll fraction to put back
         /// when the re-read document lands.
         pub reload_restore: Option<(Mode, f64)>,
+        /// Task-list ordinals the reader has clicked (each shows the
+        /// opposite of the source). UI-only; cleared on every load.
+        pub task_toggles: HashSet<u32>,
     }
 
     thread_local! {
@@ -611,6 +658,7 @@ fn new_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> WindowId {
         mode: Mode::Rendered,
         zoom,
         reload_restore: None,
+        task_toggles: Default::default(),
     };
     app_state::WINDOWS.with(|m| {
         m.borrow_mut().insert(id, state);
@@ -951,6 +999,46 @@ fn reload_file(id: WindowId) {
     with_window_mut(id, |state| state.reload_restore = Some(restore));
 }
 
+/// Flip the checkbox glyph at `char_index` in place and remember the
+/// flip so zoom rebuilds and mode swaps keep it. Never touches the file.
+fn toggle_task(id: WindowId, char_index: usize) {
+    with_window_mut(id, |state| {
+        if state.mode != Mode::Rendered {
+            return;
+        }
+        let Some(ts) = (unsafe { state.text_view.textStorage() }) else { return };
+        let key = NSString::from_str(rendered::TASK_ATTR);
+        let Some(val) =
+            (unsafe { ts.attribute_atIndex_effectiveRange(&key, char_index, std::ptr::null_mut()) })
+        else {
+            return;
+        };
+        let Ok(num) = val.downcast::<objc2_foundation::NSNumber>() else { return };
+        let ordinal = num.as_u32();
+        let was_checked =
+            ts.string().characterAtIndex(char_index) == rendered::BOX_CHECKED as u16;
+        let checked = !was_checked;
+        let glyph = if checked { rendered::BOX_CHECKED } else { rendered::BOX_UNCHECKED };
+        let range = objc2_foundation::NSRange::new(char_index, 1);
+        // Replacement inherits the old glyph's attributes (font, task
+        // ordinal, cursor); only the colour needs updating.
+        ts.replaceCharactersInRange_withString(range, &NSString::from_str(&glyph.to_string()));
+        let color = rendered::task_box_color(checked);
+        unsafe {
+            ts.addAttribute_value_range(NSForegroundColorAttributeName, &color, range);
+        }
+        if !state.task_toggles.remove(&ordinal) {
+            state.task_toggles.insert(ordinal);
+        }
+        // Keep the cached rendered string in step so a Source → Rendered
+        // round trip shows the toggled state.
+        state.rendered = Some(NSAttributedString::initWithAttributedString(
+            NSAttributedString::alloc(),
+            &ts,
+        ));
+    });
+}
+
 fn toggle_mode(id: WindowId) {
     with_window_mut(id, |state| {
         if state.doc.is_none() {
@@ -983,7 +1071,7 @@ fn set_zoom(id: WindowId, zoom: f64) {
         // fraction, rebuild both views at the new size, then restore.
         let fraction = scroll_fraction(&state.text_view);
         let bytes = doc.bytes.as_slice();
-        state.rendered = Some(rendered::build(mtm, bytes, &doc.output, zoom));
+        state.rendered = Some(rendered::build(mtm, bytes, &doc.output, zoom, &state.task_toggles));
         state.source = Some(source::build_with_parse(bytes, Some(&doc.output), zoom));
         install_attributed(state);
         set_scroll_fraction(&state.text_view, fraction);
@@ -1156,12 +1244,14 @@ fn on_document_ready(id: WindowId, doc: Arc<Document>, path: &str) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let bytes = doc.bytes.as_slice();
     let zoom = with_window_mut(id, |s| s.zoom).unwrap_or(1.0);
-    let rendered = rendered::build(mtm, bytes, &doc.output, zoom);
+    // A fresh load (including Reload) starts from what the file says.
+    let rendered = rendered::build(mtm, bytes, &doc.output, zoom, &Default::default());
     let source = source::build_with_parse(bytes, Some(&doc.output), zoom);
     with_window_mut(id, |state| {
         state.doc = Some(doc.clone());
         state.rendered = Some(rendered);
         state.source = Some(source);
+        state.task_toggles.clear();
         let restore = state.reload_restore.take();
         state.mode = restore.map_or(Mode::Rendered, |(mode, _)| mode);
         state.current_path = Some(path.to_string());

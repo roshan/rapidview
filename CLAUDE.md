@@ -64,6 +64,11 @@ CSV keeps **no per-cell index** (RAPIDVIEW-2): the only per-row state is `line_s
   via `task_marker`: the box replaces the bullet (unordered) or
   follows the number (ordered). Glyphs are pinned to Apple Symbols —
   the system font's fallbacks for ☐ and ☑ differ wildly in size.
+  Boxes are **clickable, UI-only**: the glyph carries an `MVTaskIndex`
+  ordinal attribute; `MVTextView::mouseDown:` hit-tests the glyph rect
+  and `toggle_task` flips it in the text storage, recording the ordinal
+  in `WindowState.task_toggles` so zoom rebuilds and mode swaps keep
+  it. Any load (incl. Reload) clears the toggles — the file is truth.
 - **Reload** (⇧⌘R — ⌘R is the Rendered/Source toggle; Rapid View uses
   ⌘R) re-reads the file and restores mode + scroll fraction via
   `WindowState.reload_restore`, consumed in `on_document_ready`.

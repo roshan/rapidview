@@ -12,13 +12,17 @@
 //! per-column alignment driven by the `| :--- | :---: | ---: |`
 //! separator row when present.
 
+use std::cell::Cell;
+use std::collections::HashSet;
+
 use markdown_core::{BlockKind, BlockLine, CellAlign, ParseOutput};
 use objc2::AnyThread;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSBackgroundColorAttributeName, NSBaselineOffsetAttributeName, NSColor, NSFont, NSFontAttributeName, NSFontManager,
+    NSBackgroundColorAttributeName, NSBaselineOffsetAttributeName, NSColor, NSCursor,
+    NSCursorAttributeName, NSFont, NSFontAttributeName, NSFontManager,
     NSFontTraitMask, NSFontWeightBold, NSFontWeightRegular, NSFontWeightSemibold,
     NSForegroundColorAttributeName, NSLinkAttributeName, NSMutableParagraphStyle,
     NSParagraphStyleAttributeName, NSTextAlignment, NSTextBlock, NSTextBlockDimension,
@@ -57,15 +61,34 @@ const QUOTE_RULE_WIDTH: f64 = 3.0;
 const PRE_PADDING: f64 = 10.0;
 const HR_SPACING: f64 = 16.0;
 
+/// Attribute on a task-list checkbox glyph: its `NSNumber` value is the
+/// task's ordinal in the document, which is how a click finds it.
+pub const TASK_ATTR: &str = "MVTaskIndex";
+pub const BOX_UNCHECKED: char = '☐';
+pub const BOX_CHECKED: char = '☑';
+
+pub fn task_box_color(checked: bool) -> Retained<NSColor> {
+    if checked {
+        NSColor::linkColor()
+    } else {
+        NSColor::secondaryLabelColor()
+    }
+}
+
+/// `toggled` holds the ordinals of tasks the reader has clicked: each
+/// renders opposite to what the source says. UI-only — the file is
+/// never written.
 pub fn build(
     mtm: MainThreadMarker,
     bytes: &[u8],
     parse: &ParseOutput,
     scale: f64,
+    toggled: &HashSet<u32>,
 ) -> Retained<NSAttributedString> {
     let s = std::str::from_utf8(bytes).unwrap_or("");
     let lines = slice_lines(s, parse);
-    let b = Builder::new(mtm, scale);
+    let mut b = Builder::new(mtm, scale);
+    b.toggled = toggled.clone();
 
     let mut i = 0;
     while i < parse.blocks.len() {
@@ -223,6 +246,8 @@ struct Builder {
     link_color: Retained<NSColor>,
     table_border_color: Retained<NSColor>,
     table_header_bg: Retained<NSColor>,
+    toggled: HashSet<u32>,
+    next_task: Cell<u32>,
 }
 
 impl Builder {
@@ -258,6 +283,8 @@ impl Builder {
                 0.50, 0.50, 0.50, 0.55,
             ),
             link_color: NSColor::linkColor(),
+            toggled: HashSet::new(),
+            next_task: Cell::new(0),
             table_border_color: NSColor::colorWithCalibratedRed_green_blue_alpha(
                 0.50, 0.50, 0.50, 0.45,
             ),
@@ -438,11 +465,11 @@ impl Builder {
         ]);
         self.append(&prefix, &prefix_attrs);
         if let Some(checked) = task {
-            let (glyph, color) = if checked {
-                ("☑", &*self.link_color)
-            } else {
-                ("☐", &*self.secondary_color)
-            };
+            let ordinal = self.next_task.get();
+            self.next_task.set(ordinal + 1);
+            let checked = checked ^ self.toggled.contains(&ordinal);
+            let glyph = if checked { BOX_CHECKED } else { BOX_UNCHECKED };
+            let color = task_box_color(checked);
             // ☐ and ☑ fall back to different fonts (and sizes) from the
             // system font; pin both to Apple Symbols so they match.
             let box_font = NSFont::fontWithName_size(
@@ -453,13 +480,18 @@ impl Builder {
             // The oversized glyph sits high; nudge it onto the text's
             // optical centre.
             let drop = NSNumber::new_f64(-1.5 * self.scale);
+            let task_key = NSString::from_str(TASK_ATTR);
+            let task_val = NSNumber::new_u32(ordinal);
+            let hand = NSCursor::pointingHandCursor();
             let box_attrs = attrs_for(&[
                 (unsafe { NSFontAttributeName }, &*box_font),
-                (unsafe { NSForegroundColorAttributeName }, color),
+                (unsafe { NSForegroundColorAttributeName }, &*color),
                 (unsafe { NSBaselineOffsetAttributeName }, &*drop),
                 (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
+                (unsafe { NSCursorAttributeName }, &*hand),
+                (&*task_key, &*task_val),
             ]);
-            self.append(glyph, &box_attrs);
+            self.append(&glyph.to_string(), &box_attrs);
             // Unordered: box sits in the gutter like a bullet. Ordered:
             // after the number, inline with the body (as GitHub does).
             // The separator uses the body font — a space in the big
