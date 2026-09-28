@@ -18,7 +18,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSBackgroundColorAttributeName, NSColor, NSFont, NSFontAttributeName, NSFontManager,
+    NSBackgroundColorAttributeName, NSBaselineOffsetAttributeName, NSColor, NSFont, NSFontAttributeName, NSFontManager,
     NSFontTraitMask, NSFontWeightBold, NSFontWeightRegular, NSFontWeightSemibold,
     NSForegroundColorAttributeName, NSLinkAttributeName, NSMutableParagraphStyle,
     NSParagraphStyleAttributeName, NSTextAlignment, NSTextBlock, NSTextBlockDimension,
@@ -50,6 +50,8 @@ const HEADING_SPACING_AFTER: f64 = 8.0;
 const LIST_INDENT: f64 = 26.0;
 const LIST_NEST_INDENT: f64 = 22.0;
 const LIST_ITEM_SPACING: f64 = 3.0;
+/// Task-list checkbox glyph size relative to body text.
+const TASK_BOX_SCALE: f64 = 1.6;
 const QUOTE_INDENT: f64 = 14.0;
 const QUOTE_RULE_WIDTH: f64 = 3.0;
 const PRE_PADDING: f64 = 10.0;
@@ -419,7 +421,10 @@ impl Builder {
         // wrapped continuation) aligns at `text_x` via a tab stop.
         let gutter = depth * LIST_NEST_INDENT;
         let text_x = gutter + LIST_INDENT;
-        let pstyle = self.pstyle(gutter + 4.0, text_x, 0.0, LIST_ITEM_SPACING);
+        // A checkbox is wider than a bullet, so it starts flush with
+        // the gutter to leave clear space before the text.
+        let marker_x = if task.is_some() && !ordered { gutter } else { gutter + 4.0 };
+        let pstyle = self.pstyle(marker_x, text_x, 0.0, LIST_ITEM_SPACING);
         let tab = NSTextTab::initWithType_location(
             NSTextTab::alloc(),
             NSTextTabType::LeftTabStopType,
@@ -442,18 +447,25 @@ impl Builder {
             // system font; pin both to Apple Symbols so they match.
             let box_font = NSFont::fontWithName_size(
                 &NSString::from_str("Apple Symbols"),
-                BODY_SIZE * 1.3 * self.scale,
+                BODY_SIZE * TASK_BOX_SCALE * self.scale,
             )
             .unwrap_or_else(|| self.body_font.clone());
+            // The oversized glyph sits high; nudge it onto the text's
+            // optical centre.
+            let drop = NSNumber::new_f64(-1.5 * self.scale);
             let box_attrs = attrs_for(&[
                 (unsafe { NSFontAttributeName }, &*box_font),
                 (unsafe { NSForegroundColorAttributeName }, color),
+                (unsafe { NSBaselineOffsetAttributeName }, &*drop),
                 (unsafe { NSParagraphStyleAttributeName }, &*pstyle),
             ]);
+            self.append(glyph, &box_attrs);
             // Unordered: box sits in the gutter like a bullet. Ordered:
             // after the number, inline with the body (as GitHub does).
+            // The separator uses the body font — a space in the big
+            // symbol font is too wide.
             let sep = if ordered { " " } else { "\t" };
-            self.append(&format!("{}{}", glyph, sep), &box_attrs);
+            self.append(sep, &prefix_attrs);
         }
         self.render_inline(body, &pstyle, BaseStyle::Body);
         let trailing_attrs = attrs_for(&[
