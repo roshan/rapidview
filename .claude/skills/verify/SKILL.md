@@ -66,4 +66,8 @@ screencapture -x -o -l<id> out.png
 - ⌘P toggle: Prettify↔Original (JSON/XML), Table↔Original (CSV).
 - ⌘F search: type query, Enter — orange highlight + breadcrumb follows
   the current match.
+- A test window that **vanishes with no crash report, no panic log and
+  empty stderr** was almost certainly closed by Roshan (they're often
+  at the machine and close stray dev windows). Ask before chasing it
+  as a crash.
 - Kill when done: `pkill -f "target/debug/rapid-view"`.
